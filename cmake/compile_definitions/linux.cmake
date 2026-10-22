@@ -94,8 +94,16 @@ if(LIBDRM_FOUND)
         list(APPEND PLATFORM_LIBRARIES ${LIBDRM_LIBRARIES})
         add_compile_definitions(SUNSHINE_BUILD_DRM)
         list(APPEND PLATFORM_TARGET_FILES
-                "${CMAKE_SOURCE_DIR}/src/platform/linux/kmsgrab.cpp")
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/kmsgrab.cpp"
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/virtual_display.h"
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/virtual_display.cpp")
         list(APPEND SUNSHINE_DEFINITIONS EGL_NO_X11=1)
+
+        # Privileged helper for virtual display debugfs writes (cap_dac_override)
+        add_executable(sunshine-vdisplay-helper
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/vdisplay_helper.cpp")
+        set_target_properties(sunshine-vdisplay-helper PROPERTIES CXX_STANDARD 17)
+        install(TARGETS sunshine-vdisplay-helper RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
     endif()
 endif()
 
