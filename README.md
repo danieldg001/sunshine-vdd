@@ -1,3 +1,26 @@
+> [!WARNING]
+> **This is a personal fork of [Sunshine](https://github.com/LizardByte/Sunshine).** It adds a Linux virtual
+> display (KDE Plasma Wayland + NVIDIA) on top of Sunshine. The fork's changes were made with AI assistance.
+>
+> - **Not actively maintained.** It is rebased onto stable Sunshine releases from time to time, with no schedule.
+> - **Built for one setup:** CachyOS, KDE Plasma 6 on Wayland, an NVIDIA GPU and a free DisplayPort connector.
+>   There is no support, and there are no releases or packages for anyone else.
+> - **For anything else, use [upstream Sunshine](https://github.com/LizardByte/Sunshine).**
+>
+> The virtual display backend comes from
+> [ClassicOldSong/Apollo#1477](https://github.com/ClassicOldSong/Apollo/pull/1477) by AdivonSlav.
+
+What this fork adds:
+
+- A virtual display per app: an app with `virtual-display` set streams from a monitor created for the session.
+- High refresh rates (120 Hz at 2732x2048) through a DisplayID timing in the generated EDID.
+- KMS capture driven by presented frames instead of a fixed timer.
+- A distinct monitor per client and app, so the compositor keeps scale and position for each.
+- `SUNSHINE_CLIENT_UUID` exported to prep and app commands.
+- An Arch package, `sunshine-vdd` (`packaging/linux/Arch/vdd`).
+
+---
+
 <div align="center">
   <img
     src="sunshine.svg"
