@@ -680,6 +680,37 @@ namespace stream {
     return payload.substr(sizeof(length_prefix), length);
   }
 
+  /**
+   * @brief Decrypt an `IDX_INPUT_DATA` payload and advance the legacy input IV.
+   *
+   * On success, when the tagged cipher holds at least 16 bytes beyond the IV size, its last 16 bytes become the next IV.
+   * Bytes past the length the payload declares are ignored.
+   *
+   * @param payload Control message payload.
+   * @param cipher Control stream cipher.
+   * @param iv Legacy input IV, used to decrypt and updated on success.
+   * @return The plaintext, or `std::nullopt` when the length is malformed or the tag does not verify, in which case the
+   *         session must stop.
+   */
+  std::optional<std::vector<std::uint8_t>> decrypt_input_data(std::string_view payload, crypto::cipher::gcm_t &cipher, crypto::aes_t &iv) {
+    const auto tagged_cipher = parse_input_data(payload);
+    if (!tagged_cipher) {
+      BOOST_LOG(error) << "Malformed [IDX_INPUT_DATA] length"sv;
+      return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> plaintext;
+    if (cipher.decrypt(*tagged_cipher, plaintext, &iv)) {
+      BOOST_LOG(error) << "Failed to verify tag"sv;
+      return std::nullopt;
+    }
+
+    if (tagged_cipher->size() >= 16 + iv.size()) {
+      std::copy(tagged_cipher->end() - 16, tagged_cipher->end(), std::begin(iv));
+    }
+    return plaintext;
+  }
+
   session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
     {
       // Fast path - look up existing session by peer
@@ -1236,32 +1267,13 @@ namespace stream {
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
-      const auto tagged_cipher = parse_input_data(payload);
-      if (!tagged_cipher) {
-        BOOST_LOG(error) << "Malformed [IDX_INPUT_DATA] length"sv;
-
+      auto plaintext = decrypt_input_data(payload, session->control.cipher, session->control.legacy_input_enc_iv);
+      if (!plaintext) {
         session::stop(*session);
         return;
       }
 
-      std::vector<uint8_t> plaintext;
-
-      auto &cipher = session->control.cipher;
-      auto &iv = session->control.legacy_input_enc_iv;
-      if (cipher.decrypt(*tagged_cipher, plaintext, &iv)) {
-        // something went wrong :(
-
-        BOOST_LOG(error) << "Failed to verify tag"sv;
-
-        session::stop(*session);
-        return;
-      }
-
-      if (tagged_cipher->size() >= 16 + iv.size()) {
-        std::copy(tagged_cipher->end() - 16, tagged_cipher->end(), std::begin(iv));
-      }
-
-      input::passthrough(session->input, std::move(plaintext));
+      input::passthrough(session->input, std::move(*plaintext));
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {

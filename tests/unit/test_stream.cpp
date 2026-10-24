@@ -17,12 +17,14 @@
 #include <vector>
 
 // local includes
+#include <src/crypto.h>
 #include <src/network.h>
 
 namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
   std::optional<std::pair<std::uint16_t, std::string_view>> parse_control_packet(const ENetPacket &packet);
   std::optional<std::string_view> parse_input_data(std::string_view payload);
+  std::optional<std::vector<std::uint8_t>> decrypt_input_data(std::string_view payload, crypto::cipher::gcm_t &cipher, crypto::aes_t &iv);
 }  // namespace stream
 
 TEST(ConcatAndInsertTests, ConcatNoInsertionTest) {
@@ -131,4 +133,66 @@ TEST(InputDataParseTests, AcceptsExactAndTrailing) {
   const auto trailing_view = stream::parse_input_data(trailing);
   ASSERT_TRUE(trailing_view.has_value());
   EXPECT_EQ(*trailing_view, std::string_view {trailing}.substr(4, 32));
+}
+
+namespace {
+  /**
+   * @brief Encrypt `plaintext` as a client does and frame it as an `IDX_INPUT_DATA` payload followed by `trailing`.
+   *
+   * @param tagged_cipher Receives the GCM tag and ciphertext that the length prefix delimits.
+   */
+  std::string encrypt_input_payload(const crypto::aes_t &key, crypto::aes_t iv, std::string_view plaintext, std::string_view trailing, std::string &tagged_cipher) {
+    crypto::cipher::gcm_t client {key, false};
+    tagged_cipher.assign(crypto::cipher::tag_size + plaintext.size(), '\0');
+    const int written = client.encrypt(plaintext, reinterpret_cast<std::uint8_t *>(tagged_cipher.data()), &iv);
+    EXPECT_EQ(written, static_cast<int>(plaintext.size()));
+
+    const auto length = static_cast<std::uint32_t>(tagged_cipher.size());
+    std::string payload {
+      static_cast<char>(length >> 24),
+      static_cast<char>(length >> 16),
+      static_cast<char>(length >> 8),
+      static_cast<char>(length),
+    };
+    return payload + tagged_cipher + std::string {trailing};
+  }
+
+  const crypto::aes_t input_key(16, 0x42);
+  const crypto::aes_t input_iv(16, 0x24);
+}  // namespace
+
+TEST(InputDataDecryptTests, TakesTheNextIvFromTheEndOfTheDelimitedCipher) {
+  const std::string plaintext(32, 'p');
+  std::string tagged_cipher;
+  const auto payload = encrypt_input_payload(input_key, input_iv, plaintext, "trailing bytes past the cipher", tagged_cipher);
+
+  crypto::cipher::gcm_t cipher {input_key, false};
+  auto iv = input_iv;
+  const auto decrypted = stream::decrypt_input_data(payload, cipher, iv);
+
+  ASSERT_TRUE(decrypted.has_value());
+  EXPECT_EQ(std::string(decrypted->begin(), decrypted->end()), plaintext);
+  EXPECT_EQ(std::string(iv.begin(), iv.end()), tagged_cipher.substr(tagged_cipher.size() - 16));
+}
+
+TEST(InputDataDecryptTests, RejectsAMalformedLengthWithoutTouchingTheIv) {
+  std::string tagged_cipher;
+  auto payload = encrypt_input_payload(input_key, input_iv, std::string(32, 'p'), "", tagged_cipher);
+  payload[0] = '\x7F';
+
+  crypto::cipher::gcm_t cipher {input_key, false};
+  auto iv = input_iv;
+  EXPECT_EQ(stream::decrypt_input_data(payload, cipher, iv), std::nullopt);
+  EXPECT_EQ(iv, input_iv);
+}
+
+TEST(InputDataDecryptTests, RejectsATagThatDoesNotVerify) {
+  std::string tagged_cipher;
+  auto payload = encrypt_input_payload(input_key, input_iv, std::string(32, 'p'), "", tagged_cipher);
+  payload[4] ^= 0x01;
+
+  crypto::cipher::gcm_t cipher {input_key, false};
+  auto iv = input_iv;
+  EXPECT_EQ(stream::decrypt_input_data(payload, cipher, iv), std::nullopt);
+  EXPECT_EQ(iv, input_iv);
 }
