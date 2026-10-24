@@ -288,6 +288,14 @@
                       v-model="editForm['auto-detach']"
                       default="true"
             ></Checkbox>
+            <!-- virtual display -->
+            <Checkbox class="mb-3"
+                      id="virtualDisplay"
+                      label="apps.virtual_display"
+                      desc="apps.virtual_display_desc"
+                      v-model="editForm['virtual-display']"
+                      default="false"
+            ></Checkbox>
             <!-- wait for all processes -->
             <Checkbox class="mb-3"
                       id="waitAll"
@@ -739,6 +747,7 @@
           "exclude-global-prep-cmd": false,
           elevated: false,
           "auto-detach": true,
+          "virtual-display": false,
           "wait-all": true,
           "exit-timeout": 5,
           "prep-cmd": [],
@@ -761,6 +770,9 @@
         }
         if (this.editForm["auto-detach"] === undefined) {
           this.editForm["auto-detach"] = true;
+        }
+        if (this.editForm["virtual-display"] === undefined) {
+          this.editForm["virtual-display"] = false;
         }
         if (this.editForm["wait-all"] === undefined) {
           this.editForm["wait-all"] = true;

@@ -272,3 +272,43 @@ TEST_F(ProcessPNGTest, ValidateAppImagePath_OldSteamDefault) {
   const std::string result = proc::validate_app_image_path("./assets/steam.png");
   EXPECT_EQ(result, SUNSHINE_ASSETS_DIR "/steam.png");
 }
+
+// Fixture that parses a real apps.json through proc::parse.
+class ProcessRefreshTest: public BaseTest {
+protected:
+  void SetUp() override {
+    BaseTest::SetUp();
+    test_dir = fs::temp_directory_path() / "sunshine_process_refresh_test";  // NOSONAR(cpp:S5443): safe for tests
+    fs::create_directories(test_dir);
+  }
+
+  void TearDown() override {
+    if (fs::exists(test_dir)) {
+      fs::remove_all(test_dir);
+    }
+    BaseTest::TearDown();
+  }
+
+  // Write an apps.json with the given apps array body and return its path.
+  std::string writeAppsJson(const std::string &apps_body) const {
+    const fs::path path = test_dir / "apps.json";
+    std::ofstream file(path);
+    file << R"({"env": {}, "apps": [)" << apps_body << "]}";
+    file.close();
+    return path.string();
+  }
+
+  fs::path test_dir;
+};
+
+TEST_F(ProcessRefreshTest, ParsesVirtualDisplayFlag) {
+  const auto path = writeAppsJson(R"({"name": "Virtual", "virtual-display": true}, {"name": "Plain"})");
+
+  auto parsed = proc::parse(path);
+  ASSERT_TRUE(parsed.has_value());
+
+  const auto &apps = parsed->get_apps();
+  ASSERT_EQ(apps.size(), 2u);
+  EXPECT_TRUE(apps[0].virtual_display);
+  EXPECT_FALSE(apps[1].virtual_display);
+}

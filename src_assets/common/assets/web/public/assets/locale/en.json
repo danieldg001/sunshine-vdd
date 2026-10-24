@@ -101,6 +101,8 @@
     "sort_by_name": "Sort by Name",
     "sort_default": "Default order",
     "sort_descending": "Descending",
+    "virtual_display": "Stream to a virtual display",
+    "virtual_display_desc": "Create a virtual display for this app and stream it instead of a physical monitor. Requires virtual display support on the host.",
     "wait_all": "Continue streaming until all app processes exit",
     "wait_all_desc": "This will continue streaming until all processes started by the app have terminated. When unchecked, streaming will stop when the initial app process exits, even if other app processes are still running.",
     "working_dir": "Working Directory",
