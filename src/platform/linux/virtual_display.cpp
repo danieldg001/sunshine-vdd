@@ -676,20 +676,42 @@ namespace linux_vdisplay {
     return true;
   }
 
+  /**
+   * @brief Get the sysfs `uevent` file of the card a connector belongs to.
+   *
+   * It is derived from the connector name, which the recovery state file keeps, unlike the card index.
+   *
+   * @param conn Connector, only `sysfs_name` is read.
+   * @return `/sys/class/drm/card1/uevent` for `card1-DP-2`.
+   */
+  static std::string
+    card_uevent_path(const connector_info_t &conn) {
+    return "/sys/class/drm/"s + conn.sysfs_name.substr(0, conn.sysfs_name.find('-')) + "/uevent";
+  }
+
+  /**
+   * @brief Tell the compositor that the connector changed.
+   *
+   * Uses debugfs `trigger_hotplug` when the driver has it. Not every driver does (nvidia-drm does not), and without a
+   * hotplug event the compositor only sees the new status at the next connector poll, about 10 s later, so a
+   * synthetic uevent on the card stands in.
+   *
+   * @param conn Connector whose status changed.
+   * @return `true` if the helper sent the event.
+   */
   static bool
     trigger_hotplug(const connector_info_t &conn) {
-    if (conn.debugfs_hotplug_path.empty()) {
-      return false;
-    }
-    if (!run_helper({"write-string", conn.debugfs_hotplug_path, "1"})) {
+    bool debugfs = !conn.debugfs_hotplug_path.empty() && helper_check_path(conn.debugfs_hotplug_path);
+    bool triggered = debugfs ? run_helper({"write-string", conn.debugfs_hotplug_path, "1"}) : run_helper({"trigger-drm-hotplug", card_uevent_path(conn)});
+    if (!triggered) {
       BOOST_LOG(warning) << "[Experimental] Helper failed to trigger hotplug on "sv << conn.sysfs_name;
       return false;
     }
-    BOOST_LOG(info) << "[Experimental] Hotplug triggered on "sv << conn.sysfs_name;
+    BOOST_LOG(info) << "[Experimental] Hotplug triggered on "sv << conn.sysfs_name << (debugfs ? " through debugfs"sv : " through a card uevent"sv);
     return true;
   }
 
-  constexpr int compositor_timeout_ms = 5000;  ///< How long to wait for the compositor to take the display.
+  constexpr int compositor_timeout_ms = 15000;  ///< How long to wait for the compositor to take the display. The kernel polls connectors every 10 s, the worst case when no hotplug event reaches the compositor.
 
   // Poll until the compositor assigns a CRTC to the connector (meaning it recognized the new display)
   static bool

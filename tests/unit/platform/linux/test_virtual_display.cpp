@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/platform/linux/test_virtual_display.cpp
- * @brief Tests for the Linux virtual display EDID generation, helper path allow-list, capture name and crash recovery.
+ * @brief Tests for the Linux virtual display EDID generation, helper path allow-list, hotplug uevent, capture name and crash recovery.
  */
 
 #ifdef SUNSHINE_BUILD_DRM
@@ -212,6 +212,51 @@ TEST(VirtualDisplayHelperPath, RejectsParentDirectoryComponents) {
   }
 }
 
+TEST(VirtualDisplayHelperUevent, AcceptsOnlyTheUeventFileOfADrmCard) {
+  using linux_vdisplay::helper::validate_uevent_path;
+  EXPECT_TRUE(validate_uevent_path("/sys/class/drm/card1/uevent"));
+  EXPECT_TRUE(validate_uevent_path("/sys/class/drm/card10/uevent"));
+  for (const char *path : {
+         "",
+         "/sys/class/drm/card1",
+         "/sys/class/drm/card1/",
+         "/sys/class/drm/card/uevent",
+         "/sys/class/drm/card1-DP-2/uevent",
+         "/sys/class/drm/renderD128/uevent",
+         "/sys/class/drm/card1/status",
+         "/sys/class/drm/card1/uevent/..",
+         "/sys/class/drm/card1/../card2/uevent",
+         "/sys/devices/pci0000:00/0000:00:03.1/0000:07:00.0/drm/card1/uevent",
+         "sys/class/drm/card1/uevent",
+       }) {
+    EXPECT_FALSE(validate_uevent_path(path)) << path;
+  }
+}
+
+TEST(VirtualDisplayHelperUevent, CardUeventFileIsNotOnTheGeneralAllowList) {
+  EXPECT_FALSE(linux_vdisplay::helper::validate_path("/sys/class/drm/card1/uevent"));
+}
+
+TEST(VirtualDisplayHelperUevent, BuildsAChangeEventAroundTheUuid) {
+  EXPECT_EQ(linux_vdisplay::helper::hotplug_uevent("a3440b2b-c07d-4881-b8f4-54ea9e22c325"), "change a3440b2b-c07d-4881-b8f4-54ea9e22c325 HOTPLUG=1");
+}
+
+TEST(VirtualDisplayHelperUevent, RefusesAnythingButALowercaseCanonicalUuid) {
+  using linux_vdisplay::helper::hotplug_uevent;
+  for (const char *uuid : {
+         "",
+         "not-a-uuid",
+         "a3440b2b-c07d-4881-b8f4-54ea9e22c32",
+         "a3440b2b-c07d-4881-b8f4-54ea9e22c3255",
+         "a3440b2bc07d4881b8f454ea9e22c325",
+         "A3440B2B-C07D-4881-B8F4-54EA9E22C325",
+         "a3440b2b-c07d-4881-b8f4-54ea9e22c325\n",
+         "a3440b2b-c07d-4881-b8f4-54ea9e22c325 HOTPLUG=0",
+       }) {
+    EXPECT_EQ(hotplug_uevent(uuid), "") << uuid;
+  }
+}
+
 TEST(VirtualDisplayCaptureName, StripsCardPrefix) {
   using linux_vdisplay::capture_name_for_connector;
   EXPECT_EQ(capture_name_for_connector("card1-DP-2"), "DP-2");
@@ -303,11 +348,13 @@ namespace {
       dir = dir_template;
       calls = dir / "calls";
       fail_detect = dir / "fail-detect";
+      no_debugfs_hotplug = dir / "no-debugfs-hotplug";
       state_file = dir / "vdisplay.state";
       const auto helper = dir / "sunshine-vdisplay-helper";
       std::ofstream(helper) << "#!/bin/sh\n"
                             << "echo \"$*\" >> '" << calls.string() << "'\n"
                             << "[ \"$1 $3\" = 'write-string detect' ] && [ -e '" << fail_detect.string() << "' ] && exit 1\n"
+                            << "[ \"$1\" = check-path ] && [ -e '" << no_debugfs_hotplug.string() << "' ] && exit 1\n"
                             << "exit 0\n";
       fs::permissions(helper, fs::perms::owner_all);
 
@@ -350,6 +397,7 @@ namespace {
     fs::path dir;
     fs::path calls;
     fs::path fail_detect;
+    fs::path no_debugfs_hotplug;
     std::string old_path;
   };
 }  // namespace
@@ -370,8 +418,23 @@ TEST_F(VirtualDisplayRecovery, ClearsStateOnceTheOverrideAndStatusAreRestored) {
   const std::vector<std::string> expected {
     "clear-edid "s + edid_path,
     "write-string "s + status_path + " detect",
+    "check-path "s + hotplug_path,
     "write-string "s + hotplug_path + " 1",
   };
   EXPECT_EQ(helper_calls(), expected);
 }
+
+TEST_F(VirtualDisplayRecovery, AnnouncesTheHotplugOnTheCardWhenDebugfsHasNoTriggerFile) {
+  std::ofstream {no_debugfs_hotplug};
+  linux_vdisplay::recover_crash_state();
+  EXPECT_FALSE(fs::exists(state_file));
+  const std::vector<std::string> expected {
+    "clear-edid "s + edid_path,
+    "write-string "s + status_path + " detect",
+    "check-path "s + hotplug_path,
+    "trigger-drm-hotplug /sys/class/drm/card99/uevent",
+  };
+  EXPECT_EQ(helper_calls(), expected);
+}
+
 #endif  // SUNSHINE_BUILD_DRM

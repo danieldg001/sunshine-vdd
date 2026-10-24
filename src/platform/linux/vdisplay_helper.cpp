@@ -14,7 +14,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+using linux_vdisplay::helper::hotplug_uevent;
 using linux_vdisplay::helper::validate_path;
+using linux_vdisplay::helper::validate_uevent_path;
 using linux_vdisplay::helper::write_completed;
 
 static int
@@ -88,6 +90,32 @@ static int
   return 0;
 }
 
+/**
+ * @brief Write a synthetic hotplug uevent to the sysfs `uevent` file of a DRM card.
+ *
+ * The event text is built here from a fresh random UUID; nothing the caller passes ends up in it.
+ *
+ * @param path `uevent` file, already checked by `validate_uevent_path()`.
+ * @return 0 on success, 4 if a file cannot be opened, 5 if the UUID cannot be read or the write fails.
+ */
+static int
+  cmd_trigger_drm_hotplug(const char *path) {
+  char uuid[37] = {};
+  int fd = open("/proc/sys/kernel/random/uuid", O_RDONLY);
+  if (fd < 0) {
+    perror("open");
+    return 4;
+  }
+  ssize_t n = read(fd, uuid, 36);
+  close(fd);
+  auto event = n == 36 ? hotplug_uevent(uuid) : std::string {};
+  if (event.empty()) {
+    fprintf(stderr, "Could not read a random UUID\n");
+    return 5;
+  }
+  return cmd_write_string(path, event.c_str());
+}
+
 int main(int argc, char *argv[]) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <command> <path> [value]\n", argv[0]);
@@ -96,6 +124,14 @@ int main(int argc, char *argv[]) {
 
   const char *command = argv[1];
   const char *path = argv[2];
+
+  if (strcmp(command, "trigger-drm-hotplug") == 0) {
+    if (!validate_uevent_path(path)) {
+      fprintf(stderr, "Path rejected: %s\n", path);
+      return 2;
+    }
+    return cmd_trigger_drm_hotplug(path);
+  }
 
   if (!validate_path(path)) {
     fprintf(stderr, "Path rejected: %s\n", path);
