@@ -5,37 +5,111 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
+/**
+ * @brief Virtual display backend that fakes a monitor by overriding the EDID of a disconnected DRM connector.
+ */
 namespace linux_vdisplay {
 
+  /**
+   * @brief Result of a virtual display operation.
+   */
   enum class status_e {
-    OK = 0,
-    NOT_SUPPORTED = -1,
-    NO_CONNECTOR = -2,
-    EDID_WRITE_FAILED = -3,
-    REPROBE_FAILED = -4,
-    COMPOSITOR_TIMEOUT = -5,
+    OK = 0,  ///< The operation succeeded.
+    NOT_SUPPORTED = -1,  ///< debugfs or DRM devices are unavailable, or creation threw an exception.
+    NO_CONNECTOR = -2,  ///< No disconnected connector is available to host the display.
+    EDID_WRITE_FAILED = -3,  ///< The EDID could not be written, the parameters were invalid, or the override could not be cleared.
+    REPROBE_FAILED = -4,  ///< The connector status could not be forced on after the EDID was written, or restored on removal.
+    COMPOSITOR_TIMEOUT = -5,  ///< The compositor did not pick up the new display in time.
   };
 
+  /**
+   * @brief A DRM connector that can host a virtual display.
+   */
   struct connector_info_t {
-    std::string card_path;
-    int card_index;
-    std::uint32_t connector_id;
-    std::uint32_t connector_type;
-    std::uint32_t connector_index;
-    std::string sysfs_name;
-    std::string debugfs_edid_path;
-    std::string sysfs_status_path;
-    std::string debugfs_hotplug_path;
+    std::string card_path;  ///< Path of the DRM device node, for example `/dev/dri/card1`.
+    int card_index;  ///< Index of the DRM card.
+    std::uint32_t connector_id;  ///< DRM connector object id.
+    std::uint32_t connector_type;  ///< DRM connector type, one of the `DRM_MODE_CONNECTOR_*` values.
+    std::uint32_t connector_index;  ///< Per-type connector index, the `2` in `DP-2`.
+    std::string sysfs_name;  ///< Connector name as in sysfs, for example `card1-DP-2`.
+    std::string debugfs_edid_path;  ///< debugfs `edid_override` file of the connector.
+    std::string sysfs_status_path;  ///< sysfs `status` file of the connector.
+    std::string debugfs_hotplug_path;  ///< debugfs `trigger_hotplug` file of the connector, empty if unavailable.
   };
 
+  /**
+   * @brief Check whether a virtual display can be created on this system.
+   * @return `true` if debugfs DRI is reachable through the helper and a DRM card can be opened.
+   */
   bool is_supported();
+
+  /**
+   * @brief Undo an EDID override left behind by a previous run that did not shut down cleanly.
+   *
+   * The recovery state file is kept if the override cannot be cleared or the connector status cannot be restored,
+   * so the next start retries.
+   */
   void recover_crash_state();
+
+  /**
+   * @brief Replace the path of the recovery state file, so tests never touch the real appdata directory.
+   * @param path New path; empty restores the default `vdisplay.state` in the appdata directory.
+   * @return The previous override, empty if the default was in use.
+   */
+  std::filesystem::path set_state_file_path(std::filesystem::path path);
+
+  /**
+   * @brief Create a virtual display on a disconnected connector.
+   *
+   * The recovery state is persisted before the EDID is written. If the previous display could not
+   * be removed, its status is returned and nothing new is created.
+   * If creation throws, the display is kept as active so `remove()` can undo whatever was applied.
+   *
+   * @param out_display_name Receives the connector name on success.
+   * @param width Width in pixels.
+   * @param height Height in pixels.
+   * @param fps_millihertz Refresh rate in millihertz, clamped to 24-360 Hz.
+   * @param client_id Client identifier used to derive a stable EDID serial, may be empty.
+   * @return `status_e::OK` on success, otherwise the reason it failed.
+   */
   status_e create(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &client_id);
+
+  /**
+   * @brief Remove the active virtual display, if any.
+   * @return `status_e::OK` when nothing is active or the display was removed. `status_e::EDID_WRITE_FAILED`
+   *         if the EDID override could not be cleared, `status_e::REPROBE_FAILED` if the connector status could not
+   *         be restored; in both cases the display stays active so the call can be retried.
+   */
   status_e remove();
+
+  /**
+   * @brief Check whether a virtual display is currently active.
+   * @return `true` if a virtual display is active.
+   */
   bool is_active();
+
+  /**
+   * @brief Get the KMS monitor index of the active virtual display, as kmsgrab numbers them.
+   * @return The index, or -1 if no display is active or it has no CRTC yet.
+   */
   int get_kms_index();
+
+  /**
+   * @brief Build the two-block EDID (base block plus CTA-861 extension) for a virtual display.
+   *
+   * Exposed so unit tests can check the generated bytes without touching hardware.
+   *
+   * @param width Width in pixels, the encoded preferred mode rounds it down to a multiple of 8.
+   * @param height Height in pixels.
+   * @param refresh_hz Refresh rate in Hz.
+   * @param client_id Client identifier hashed into the EDID serial. Empty selects a fixed serial.
+   * @return The 256 bytes of EDID.
+   */
+  std::array<std::uint8_t, 256> generate_edid(int width, int height, int refresh_hz, const std::string &client_id);
 
 }  // namespace linux_vdisplay

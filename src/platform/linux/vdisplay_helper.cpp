@@ -5,40 +5,17 @@
  * Installed with cap_dac_override+ep so the main sunshine process
  * does not need CAP_DAC_OVERRIDE in its capability set.
  */
+#include "vdisplay_helper_path.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <regex.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-static bool
-  validate_path(const char *path) {
-  if (strcmp(path, "/sys/kernel/debug/dri") == 0) {
-    return true;
-  }
-
-  static const char *patterns[] = {
-    "^/sys/kernel/debug/dri/[0-9]+/[A-Za-z]+(-[A-Za-z]+)*-[0-9]+/edid_override$",
-    "^/sys/kernel/debug/dri/[0-9]+/[A-Za-z]+(-[A-Za-z]+)*-[0-9]+/trigger_hotplug$",
-    "^/sys/class/drm/card[0-9]+-[A-Za-z]+(-[A-Za-z]+)*-[0-9]+/status$",
-  };
-
-  for (auto pattern : patterns) {
-    regex_t re;
-    if (regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
-      continue;
-    }
-    int match = regexec(&re, path, 0, nullptr, 0);
-    regfree(&re);
-    if (match == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
+using linux_vdisplay::helper::validate_path;
+using linux_vdisplay::helper::write_completed;
 
 static int
   safe_open(const char *path) {
@@ -82,11 +59,16 @@ static int
     return 4;
   }
   ssize_t n = write(fd, "reset", 5);
+  bool cleared = write_completed(n, 5);
   if (n < 0) {
-    lseek(fd, 0, SEEK_SET);
-    write(fd, "", 0);
+    // Older kernels reject "reset"; an empty write clears the override instead.
+    cleared = lseek(fd, 0, SEEK_SET) >= 0 && write_completed(write(fd, "", 0), 0);
   }
   close(fd);
+  if (!cleared) {
+    fprintf(stderr, "Failed to clear the EDID override\n");
+    return 5;
+  }
   return 0;
 }
 
@@ -99,7 +81,7 @@ static int
   }
   ssize_t n = write(fd, value, strlen(value));
   close(fd);
-  if (n < 0) {
+  if (!write_completed(n, strlen(value))) {
     perror("write");
     return 5;
   }

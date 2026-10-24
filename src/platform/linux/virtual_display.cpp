@@ -15,6 +15,7 @@
 #include <numeric>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 // lib includes
 #include <boost/process/v1/args.hpp>
@@ -204,7 +205,7 @@ namespace linux_vdisplay {
     return hash;
   }
 
-  static std::array<uint8_t, 256>
+  std::array<uint8_t, 256>
     generate_edid(int width, int height, int refresh_hz, const std::string &client_id) {
     std::array<uint8_t, 256> edid {};
 
@@ -376,21 +377,30 @@ namespace linux_vdisplay {
 
   static std::optional<active_state_t> active_state;
 
+  // Set only by tests, through set_state_file_path().
+  static fs::path state_file_override;
+
   static fs::path
     state_file_path() {
-    return platf::appdata() / "vdisplay.state";
+    return state_file_override.empty() ? platf::appdata() / "vdisplay.state" : state_file_override;
   }
 
-  static void
+  fs::path set_state_file_path(fs::path path) {
+    return std::exchange(state_file_override, std::move(path));
+  }
+
+  static bool
     save_state(const connector_info_t &conn) {
-    std::error_code ec;
     std::ofstream f(state_file_path(), std::ios::trunc);
-    if (f) {
-      f << conn.debugfs_edid_path << '\n'
-        << conn.sysfs_status_path << '\n'
-        << conn.debugfs_hotplug_path << '\n'
-        << conn.sysfs_name << '\n';
+    if (!f) {
+      return false;
     }
+    f << conn.debugfs_edid_path << '\n'
+      << conn.sysfs_status_path << '\n'
+      << conn.debugfs_hotplug_path << '\n'
+      << conn.sysfs_name << '\n';
+    f.flush();
+    return static_cast<bool>(f);
   }
 
   static void
@@ -882,12 +892,31 @@ namespace linux_vdisplay {
     conn.debugfs_hotplug_path = hotplug_path;
     conn.sysfs_name = sysfs_name;
 
-    clear_edid(conn);
-    force_status(conn, "detect");
+    if (!clear_edid(conn)) {
+      BOOST_LOG(error) << "[Experimental] Could not clear the stale EDID on "sv << sysfs_name << ", keeping the state file to retry on the next start"sv;
+      return;
+    }
+    if (!force_status(conn, "detect")) {
+      BOOST_LOG(error) << "[Experimental] Could not restore the status of "sv << sysfs_name << ", keeping the state file to retry on the next start"sv;
+      return;
+    }
     trigger_hotplug(conn);
 
     clear_state();
     BOOST_LOG(info) << "[Experimental] Crash recovery complete — cleared stale EDID on "sv << sysfs_name;
+  }
+
+  // Undo a partially applied create(). Once the override is confirmed gone both the state file and the in-memory
+  // state are dropped. Otherwise both stay, marked as written, so the next remove() or create() retries the cleanup
+  // before anything overwrites the record of the override.
+  static void
+    revert_failed_create(const connector_info_t &conn) {
+    if (clear_edid(conn)) {
+      clear_state();
+      active_state.reset();
+    } else if (active_state) {
+      active_state->edid_written = true;
+    }
   }
 
   static status_e
@@ -898,7 +927,9 @@ namespace linux_vdisplay {
     }
 
     if (active_state) {
-      remove();
+      if (auto status = remove(); status != status_e::OK) {
+        return status;
+      }
     }
 
     auto candidates = find_disconnected_connectors();
@@ -936,8 +967,15 @@ namespace linux_vdisplay {
     int refresh_hz = std::clamp((fps_millihertz + 500) / 1000, 24, 360);
     auto edid = generate_edid(width, height, refresh_hz, client_id);
 
-    if (!write_edid(conn, edid.data(), edid.size())) {
+    // Record the override before applying it, so a crash at any later point can be recovered.
+    if (!save_state(conn)) {
+      BOOST_LOG(error) << "[Experimental] Could not persist the recovery state, not touching "sv << conn.sysfs_name;
       active_state.reset();
+      return status_e::EDID_WRITE_FAILED;
+    }
+
+    if (!write_edid(conn, edid.data(), edid.size())) {
+      revert_failed_create(conn);
       return status_e::EDID_WRITE_FAILED;
     }
     active_state->edid_written = true;
@@ -946,8 +984,7 @@ namespace linux_vdisplay {
                     << (client_id.empty() ? ""sv : " (client: "sv) << client_id << (client_id.empty() ? ""sv : ")"sv);
 
     if (!force_status(conn, "on")) {
-      clear_edid(conn);
-      active_state.reset();
+      revert_failed_create(conn);
       return status_e::REPROBE_FAILED;
     }
     active_state->reprobed = true;
@@ -962,7 +999,6 @@ namespace linux_vdisplay {
       configure_xrandr(conn);
     }
 
-    save_state(conn);
     out_display_name = conn.sysfs_name;
     return status_e::OK;
   }
@@ -973,7 +1009,10 @@ namespace linux_vdisplay {
       return create_impl(out_display_name, width, height, fps_millihertz, client_id);
     } catch (const std::exception &e) {
       BOOST_LOG(error) << "[Experimental] Virtual display creation threw: "sv << e.what();
-      active_state.reset();
+      // The override may already be applied, so keep the state, marked as written, for remove() to clean up.
+      if (active_state) {
+        active_state->edid_written = true;
+      }
       return status_e::NOT_SUPPORTED;
     }
   }
@@ -986,11 +1025,18 @@ namespace linux_vdisplay {
 
     auto conn = active_state->connector;
 
+    // Keep the state, in memory and on disk, until the override is cleared and the connector status restored, so a
+    // later call can retry whatever step failed.
     if (active_state->edid_written) {
-      clear_edid(conn);
+      if (!clear_edid(conn)) {
+        return status_e::EDID_WRITE_FAILED;
+      }
+      active_state->edid_written = false;
     }
 
-    force_status(conn, "detect");
+    if (!force_status(conn, "detect")) {
+      return status_e::REPROBE_FAILED;
+    }
     trigger_hotplug(conn);
     std::this_thread::sleep_for(500ms);
 
