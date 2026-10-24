@@ -168,6 +168,13 @@ namespace input {
      * @return Number of queued packets, or zero for an empty input pointer.
      */
     std::size_t queued_input_packet_count(const std::shared_ptr<input_t> &input);
+
+    /**
+     * @brief Batch and deliver the next queued packet on the calling thread, as a task pool worker does.
+     *
+     * @param input Shared stream input state.
+     */
+    void process_next_input_packet(const std::shared_ptr<input_t> &input);
   }  // namespace testing
 #endif
 

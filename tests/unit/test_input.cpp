@@ -250,6 +250,94 @@ TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) 
   }
 }
 
+namespace {
+  /**
+   * @brief Serialize a fixed-size packet whose header is already filled in.
+   *
+   * @param packet Packet to copy.
+   * @return Raw packet bytes.
+   */
+  template<typename packet_t>
+  std::vector<std::uint8_t> to_bytes(const packet_t &packet) {
+    const auto *bytes = reinterpret_cast<const std::uint8_t *>(&packet);
+    return {bytes, bytes + sizeof(packet)};
+  }
+
+  /**
+   * @brief Build a relative mouse move packet.
+   *
+   * @param delta_x Horizontal delta.
+   * @param delta_y Vertical delta.
+   * @return Raw packet bytes.
+   */
+  std::vector<std::uint8_t> make_rel_mouse_packet(short delta_x, short delta_y) {
+    NV_REL_MOUSE_MOVE_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_REL_MAGIC_GEN5);
+    packet.deltaX = util::endian::big(delta_x);
+    packet.deltaY = util::endian::big(delta_y);
+    return to_bytes(packet);
+  }
+
+  /**
+   * @brief Build a vertical scroll packet.
+   *
+   * @param amount Scroll distance.
+   * @return Raw packet bytes.
+   */
+  std::vector<std::uint8_t> make_scroll_packet(short amount) {
+    NV_SCROLL_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little<std::uint32_t>(SCROLL_MAGIC_GEN5);
+    packet.scrollAmt1 = util::endian::big(amount);
+    packet.scrollAmt2 = packet.scrollAmt1;
+    return to_bytes(packet);
+  }
+
+  /**
+   * @brief Build a horizontal scroll packet.
+   *
+   * @param amount Scroll distance.
+   * @return Raw packet bytes.
+   */
+  std::vector<std::uint8_t> make_hscroll_packet(short amount) {
+    SS_HSCROLL_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little<std::uint32_t>(SS_HSCROLL_MAGIC);
+    packet.scrollAmount = util::endian::big(amount);
+    return to_bytes(packet);
+  }
+}  // namespace
+
+TEST_F(InputGamepadSessionTest, BatchesRelativeInputOnlyWhenTheSumFitsInSixteenBits) {
+  config::input.mouse = true;
+  config::input.high_resolution_scrolling = true;
+  auto stream_input = input::alloc(std::make_shared<safe::mail_raw_t>(), "batching-client");
+  ASSERT_NE(stream_input, nullptr);
+
+  // Queue the packets, drain them the way the task pool does, and count what reached the mouse.
+  const auto dispatches = [&](std::vector<std::vector<std::uint8_t>> packets) {
+    const auto before = context().mouse->submit_count();
+    for (auto &packet : packets) {
+      input::passthrough(stream_input, std::move(packet));
+    }
+    while (input::testing::queued_input_packet_count(stream_input) > 0) {
+      input::testing::process_next_input_packet(stream_input);
+    }
+    return context().mouse->submit_count() - before;
+  };
+
+  EXPECT_EQ(dispatches({make_rel_mouse_packet(100, 0), make_rel_mouse_packet(50, 0), make_rel_mouse_packet(100, 0)}), 1U);
+  EXPECT_EQ(dispatches({make_rel_mouse_packet(0, 100), make_rel_mouse_packet(0, 50), make_rel_mouse_packet(0, 100)}), 1U);
+  EXPECT_EQ(dispatches({make_rel_mouse_packet(20000, 20000), make_rel_mouse_packet(20000, 20000), make_rel_mouse_packet(20000, 20000)}), 3U);
+
+  EXPECT_EQ(dispatches({make_scroll_packet(100), make_scroll_packet(50), make_scroll_packet(100)}), 1U);
+  EXPECT_EQ(dispatches({make_scroll_packet(20000), make_scroll_packet(20000), make_scroll_packet(20000)}), 3U);
+
+  EXPECT_EQ(dispatches({make_hscroll_packet(100), make_hscroll_packet(50), make_hscroll_packet(100)}), 1U);
+  EXPECT_EQ(dispatches({make_hscroll_packet(20000), make_hscroll_packet(20000), make_hscroll_packet(20000)}), 3U);
+}
+
 TEST_F(InputGamepadSessionTest, ReusesGamepadsAcrossPauseAndDestroysThemOnTermination) {
   const std::string session_id = "paired-client-certificate";
   auto first_mail = std::make_shared<safe::mail_raw_t>();
