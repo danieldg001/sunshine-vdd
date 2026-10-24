@@ -1,0 +1,71 @@
+# Packages the vdd fork of Sunshine from the local, already built checkout.
+# Build first: ninja -C build sunshine sunshine-vdisplay-helper web-ui
+# Then, from this directory: makepkg -f
+
+pkgname='sunshine-vdd'
+# Derived from git: v2026.914.233613-12-g9ddffa0f -> 2026.914.233613.r12.g9ddffa0f
+_repo="$(cd "${startdir:-$PWD}/../../../.." && pwd)"
+pkgver="$(git -C "$_repo" describe --tags --long | sed 's/^v//; s/-\([0-9]\+\)-g/.r\1.g/')"
+pkgrel=1
+pkgdesc='Sunshine game stream host with a Linux virtual display (fork of LizardByte/Sunshine)'
+arch=('x86_64')
+url='https://github.com/LizardByte/Sunshine'
+license=('GPL-3.0-only')
+install=sunshine-vdd.install
+options=('!debug')
+
+depends=(
+  'avahi'
+  'curl'
+  'gcc-libs'
+  'gtk3'
+  'hicolor-icon-theme'
+  'libayatana-appindicator'
+  'libcap'
+  'libdrm'
+  'libevdev'
+  'libmfx'
+  'libpipewire'
+  'libpulse'
+  'libva'
+  'libx11'
+  'libxcb'
+  'libxfixes'
+  'libxrandr'
+  'libxtst'
+  'miniupnpc'
+  'numactl'
+  'openssl'
+  'opus'
+  'qt6-base'
+  'qt6-svg'
+  'udev'
+  'vulkan-icd-loader'
+  'which'
+)
+
+optdepends=(
+  'cuda: Nvidia GPU encoding support'
+  'libva-mesa-driver: AMD GPU encoding support'
+)
+
+provides=('sunshine')
+conflicts=('sunshine' 'apollo')
+
+# No sources and no build(): this installs the checkout's existing build.
+source=()
+sha256sums=()
+
+package() {
+  local _build="$_repo/build"
+
+  if [[ ! -x "$_build/sunshine" || ! -x "$_build/sunshine-vdisplay-helper" || ! -f "$_build/assets/web/config.html" ]]; then
+    echo "Missing build output in $_build; run: ninja -C build sunshine sunshine-vdisplay-helper web-ui" >&2
+    return 1
+  fi
+
+  DESTDIR="$pkgdir" cmake --install "$_build"
+
+  # Group that owns the privileged virtual display helper.
+  printf 'g sunshine-vdd - -\n' | install -Dm644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/sunshine-vdd.conf"
+}

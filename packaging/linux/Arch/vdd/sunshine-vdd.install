@@ -1,0 +1,58 @@
+# shellcheck shell=bash
+
+# Run a required step. On failure, say what failed and how to redo it by hand, and return 1.
+do_required() {
+  local what="$1"
+  shift
+  if ! "$@"; then
+    echo "==> ERROR: sunshine-vdd: ${what} failed. Fix it manually with: cd / && $*" >&2
+    return 1
+  fi
+}
+
+do_setcap() {
+  do_required "setting capabilities on sunshine" \
+    setcap cap_sys_admin,cap_sys_nice+p "$(readlink -f usr/bin/sunshine)"
+}
+
+do_vdisplay_helper() {
+  # The helper writes the debugfs EDID override: root, group sunshine-vdd, mode 0750, cap_dac_override.
+  # Each step depends on the previous one, so stop at the first failure.
+  local helper=usr/bin/sunshine-vdisplay-helper
+  do_required "creating the sunshine-vdd group" systemd-sysusers /usr/lib/sysusers.d/sunshine-vdd.conf || return 1
+  do_required "changing the owner of the virtual display helper" chown root:sunshine-vdd "$helper" || return 1
+  do_required "changing the mode of the virtual display helper" chmod 0750 "$helper" || return 1
+  do_required "setting capabilities on the virtual display helper" setcap cap_dac_override+ep "$helper" || return 1
+}
+
+do_udev_reload() {
+  udevadm control --reload-rules
+  udevadm trigger --property-match=DEVNAME=/dev/uinput
+  udevadm trigger --property-match=DEVNAME=/dev/uhid
+  udevadm trigger --subsystem-match=hidraw
+  udevadm trigger --subsystem-match=input
+  modprobe uinput || true
+  modprobe uhid || true
+}
+
+post_install() {
+  local rc=0
+  do_setcap || rc=1
+  do_vdisplay_helper || rc=1
+  do_udev_reload
+  modprobe uhid || true
+
+  echo "==> Add your user to the sunshine-vdd group to let Sunshine run the virtual display helper:"
+  echo "      sudo usermod -aG sunshine-vdd \$USER"
+  echo "==> Then log out and back in for the group to take effect."
+  return $rc
+}
+
+post_upgrade() {
+  local rc=0
+  do_setcap || rc=1
+  do_vdisplay_helper || rc=1
+  do_udev_reload
+  modprobe uhid || true
+  return $rc
+}
