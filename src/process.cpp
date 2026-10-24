@@ -32,6 +32,10 @@
 #include "system_tray.h"
 #include "utility.h"
 
+#ifdef SUNSHINE_BUILD_DRM
+  #include "platform/linux/virtual_display.h"
+#endif
+
 #ifdef _WIN32
   // from_utf8() string conversion function
   #include "platform/windows/utf_utils.h"
@@ -366,6 +370,13 @@ namespace proc {
 
       display_device::revert_configuration();
     }
+
+#ifdef SUNSHINE_BUILD_DRM
+    // execute() starts with terminate(), so only an app that ran owns the virtual display created for it.
+    if (has_run) {
+      linux_vdisplay::end_capture();
+    }
+#endif
 
     _app_id = -1;
   }

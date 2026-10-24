@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/platform/linux/test_virtual_display.cpp
- * @brief Tests for the Linux virtual display EDID generation, helper path allow-list and crash recovery.
+ * @brief Tests for the Linux virtual display EDID generation, helper path allow-list, capture name and crash recovery.
  */
 
 #ifdef SUNSHINE_BUILD_DRM
@@ -14,6 +14,7 @@
   #include <cstdlib>
   #include <filesystem>
   #include <fstream>
+  #include <limits>
   #include <numeric>
   #include <string>
   #include <unistd.h>
@@ -209,6 +210,78 @@ TEST(VirtualDisplayHelperPath, RejectsParentDirectoryComponents) {
        }) {
     EXPECT_FALSE(validate_path(path)) << path;
   }
+}
+
+TEST(VirtualDisplayCaptureName, StripsCardPrefix) {
+  using linux_vdisplay::capture_name_for_connector;
+  EXPECT_EQ(capture_name_for_connector("card1-DP-2"), "DP-2");
+  EXPECT_EQ(capture_name_for_connector("card10-HDMI-A-1"), "HDMI-A-1");
+  EXPECT_EQ(capture_name_for_connector("DP-2"), "DP-2");
+  EXPECT_EQ(capture_name_for_connector(""), "");
+  EXPECT_EQ(capture_name_for_connector("cardX-DP-2"), "cardX-DP-2");
+}
+
+TEST(VirtualDisplayRefresh, ClampsClientFpsBeforeConvertingToMillihertz) {
+  using linux_vdisplay::refresh_millihertz_for_fps;
+  EXPECT_EQ(refresh_millihertz_for_fps(60), 60000);
+  EXPECT_EQ(refresh_millihertz_for_fps(24), 24000);
+  EXPECT_EQ(refresh_millihertz_for_fps(360), 360000);
+  EXPECT_EQ(refresh_millihertz_for_fps(0), 24000);
+  EXPECT_EQ(refresh_millihertz_for_fps(-5), 24000);
+  EXPECT_EQ(refresh_millihertz_for_fps(std::numeric_limits<int>::min()), 24000);
+  EXPECT_EQ(refresh_millihertz_for_fps(3000000), 360000);
+  EXPECT_EQ(refresh_millihertz_for_fps(std::numeric_limits<int>::max()), 360000);
+}
+
+TEST(VirtualDisplayMode, AcceptsModesAtLeastTheMinimumSize) {
+  using linux_vdisplay::is_supported_mode;
+  EXPECT_TRUE(is_supported_mode(256, 256));
+  EXPECT_TRUE(is_supported_mode(2732, 2048));
+}
+
+TEST(VirtualDisplayMode, RejectsModesBelowTheMinimumSizeOrNonPositive) {
+  using linux_vdisplay::is_supported_mode;
+  EXPECT_FALSE(is_supported_mode(255, 2048));
+  EXPECT_FALSE(is_supported_mode(2732, 255));
+  EXPECT_FALSE(is_supported_mode(0, 0));
+  EXPECT_FALSE(is_supported_mode(-1, 100));
+}
+
+TEST(VirtualDisplayMode, AcceptsTheLargestModeTheEdidCanEncode) {
+  using linux_vdisplay::is_supported_mode;
+  EXPECT_TRUE(is_supported_mode(4095, 4095));
+  EXPECT_TRUE(is_supported_mode(256, 4095));
+  EXPECT_TRUE(is_supported_mode(4095, 256));
+}
+
+TEST(VirtualDisplayMode, RejectsModesTheEdidCannotEncode) {
+  using linux_vdisplay::is_supported_mode;
+  constexpr int int_max = std::numeric_limits<int>::max();
+  EXPECT_FALSE(is_supported_mode(4096, 2048));
+  EXPECT_FALSE(is_supported_mode(2732, 4096));
+  EXPECT_FALSE(is_supported_mode(4096, 4096));
+  EXPECT_FALSE(is_supported_mode(int_max, 2048));
+  EXPECT_FALSE(is_supported_mode(2732, int_max));
+  EXPECT_FALSE(is_supported_mode(int_max, int_max));
+}
+
+TEST(VirtualDisplayEdid, LargestSupportedModeIsEncodedExactly) {
+  auto edid = make({4095, 4095, 60});
+  auto preferred = decode_dtd(edid, 54);
+  EXPECT_EQ(preferred.h_active, 4088);
+  EXPECT_EQ(preferred.v_active, 4095);
+  for (std::size_t block = 0; block < edid.size() / 128; ++block) {
+    EXPECT_EQ(block_sum(edid, block * 128, 128), 0) << "block " << block;
+  }
+}
+
+TEST(VirtualDisplayMode, CreateRejectsInvalidRequestBeforeTouchingTheSystem) {
+  std::string name;
+  EXPECT_EQ(linux_vdisplay::create(name, 100, 100, 60000, ""), linux_vdisplay::status_e::EDID_WRITE_FAILED);
+  EXPECT_EQ(linux_vdisplay::create(name, 4096, 2048, 60000, ""), linux_vdisplay::status_e::EDID_WRITE_FAILED);
+  EXPECT_EQ(linux_vdisplay::create(name, std::numeric_limits<int>::max(), 2048, 60000, ""), linux_vdisplay::status_e::EDID_WRITE_FAILED);
+  EXPECT_EQ(linux_vdisplay::create(name, 1920, 1080, 0, ""), linux_vdisplay::status_e::EDID_WRITE_FAILED);
+  EXPECT_TRUE(name.empty());
 }
 
 using namespace std::string_literals;

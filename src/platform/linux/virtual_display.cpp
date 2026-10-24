@@ -369,6 +369,10 @@ namespace linux_vdisplay {
     return edid;
   }
 
+  // Refresh range of the generated EDID, in Hz.
+  constexpr int min_refresh_hz = 24;
+  constexpr int max_refresh_hz = 360;
+
   struct active_state_t {
     connector_info_t connector;
     bool edid_written = false;
@@ -685,6 +689,8 @@ namespace linux_vdisplay {
     return true;
   }
 
+  constexpr int compositor_timeout_ms = 5000;  ///< How long to wait for the compositor to take the display.
+
   // Poll until the compositor assigns a CRTC to the connector (meaning it recognized the new display)
   static bool
     wait_for_connector_active(const connector_info_t &conn, int timeout_ms) {
@@ -919,8 +925,27 @@ namespace linux_vdisplay {
     }
   }
 
+  bool
+    is_supported_mode(int width, int height) {
+    auto fits = [](int dimension) {
+      return dimension >= min_virtual_display_dimension && dimension <= max_virtual_display_dimension;
+    };
+    return fits(width) && fits(height);
+  }
+
   static status_e
     create_impl(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &client_id) {
+    if (!is_supported_mode(width, height)) {
+      BOOST_LOG(warning) << "[Experimental] Refusing "sv << width << "x"sv << height << " virtual display, each side must be "sv
+                         << min_virtual_display_dimension << "-"sv << max_virtual_display_dimension << " pixels"sv;
+      return status_e::EDID_WRITE_FAILED;
+    }
+
+    if (fps_millihertz <= 0) {
+      BOOST_LOG(error) << "[Experimental] Missing refresh parameter for virtual display"sv;
+      return status_e::EDID_WRITE_FAILED;
+    }
+
     if (!is_supported()) {
       BOOST_LOG(info) << "[Experimental] Virtual display not supported on this system"sv;
       return status_e::NOT_SUPPORTED;
@@ -958,13 +983,7 @@ namespace linux_vdisplay {
 
     active_state = active_state_t {conn, false, false};
 
-    if (width <= 0 || height <= 0 || fps_millihertz <= 0) {
-      BOOST_LOG(error) << "[Experimental] Missing resolution/refresh parameters for virtual display"sv;
-      active_state.reset();
-      return status_e::EDID_WRITE_FAILED;
-    }
-
-    int refresh_hz = std::clamp((fps_millihertz + 500) / 1000, 24, 360);
+    int refresh_hz = std::clamp((fps_millihertz + 500) / 1000, min_refresh_hz, max_refresh_hz);
     auto edid = generate_edid(width, height, refresh_hz, client_id);
 
     // Record the override before applying it, so a crash at any later point can be recovered.
@@ -991,12 +1010,15 @@ namespace linux_vdisplay {
 
     trigger_hotplug(conn);
 
-    if (!wait_for_connector_active(conn, 5000)) {
-      BOOST_LOG(warning) << "[Experimental] Proceeding despite compositor timeout"sv;
-    }
-
+    // X11 may only give the output a CRTC once xrandr enables it, so do that before waiting for one.
     if (window_system == window_system_e::X11) {
       configure_xrandr(conn);
+    }
+
+    if (!wait_for_connector_active(conn, compositor_timeout_ms)) {
+      BOOST_LOG(error) << "[Experimental] The compositor did not take "sv << conn.sysfs_name << " within "sv << compositor_timeout_ms
+                       << " ms, not capturing it so the stream does not show another display"sv;
+      return status_e::COMPOSITOR_TIMEOUT;
     }
 
     out_display_name = conn.sysfs_name;
@@ -1065,6 +1087,48 @@ namespace linux_vdisplay {
       return -1;
     }
     return find_kms_index(active_state->connector);
+  }
+
+  std::string capture_name_for_connector(std::string_view connector) {
+    constexpr auto prefix = "card"sv;
+    auto digits_end = connector.find_first_not_of("0123456789"sv, prefix.size());
+    if (connector.starts_with(prefix) && digits_end > prefix.size() && digits_end != std::string_view::npos && connector[digits_end] == '-') {
+      connector.remove_prefix(digits_end + 1);
+    }
+    return std::string {connector};
+  }
+
+  int refresh_millihertz_for_fps(int fps_hz) {
+    return std::clamp(fps_hz, min_refresh_hz, max_refresh_hz) * 1000;
+  }
+
+  // The output_name that was configured before begin_capture() redirected it, empty when nothing is saved.
+  static std::optional<std::string> saved_output_name;
+
+  status_e begin_capture(int width, int height, int fps_hz, const std::string &client_uuid) {
+    std::string connector;
+    auto status = create(connector, width, height, refresh_millihertz_for_fps(fps_hz), client_uuid);
+    if (status != status_e::OK) {
+      end_capture();
+      return status;
+    }
+
+    if (!saved_output_name) {
+      saved_output_name = config::video.output_name;
+    }
+    config::video.output_name = capture_name_for_connector(connector);
+    BOOST_LOG(info) << "[Experimental] Capturing virtual display output "sv << config::video.output_name;
+    return status_e::OK;
+  }
+
+  void end_capture() {
+    if (is_active() && remove() != status_e::OK) {
+      BOOST_LOG(error) << "[Experimental] Could not remove the virtual display, its recovery state is kept for a retry"sv;
+    }
+    if (saved_output_name) {
+      config::video.output_name = std::move(*saved_output_name);
+      saved_output_name.reset();
+    }
   }
 
 }  // namespace linux_vdisplay

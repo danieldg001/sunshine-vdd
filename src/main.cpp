@@ -21,6 +21,7 @@
   #include <sys/auxv.h>
   #if defined(SUNSHINE_BUILD_DRM)
     #include "platform/linux/misc.h"
+    #include "platform/linux/virtual_display.h"
   #endif
 #endif
 
@@ -298,6 +299,9 @@ int main(int argc, char *argv[]) {
   if (!display_device_deinit_guard) {
     BOOST_LOG(error) << "Display device session failed to initialize"sv;
   }
+#ifdef SUNSHINE_BUILD_DRM
+  linux_vdisplay::recover_crash_state();
+#endif
 
 #ifdef _WIN32
   // Modify relevant NVIDIA control panel settings if the system has corresponding gpu

@@ -39,6 +39,10 @@
 #include "uuid.h"
 #include "video.h"
 
+#ifdef SUNSHINE_BUILD_DRM
+  #include "platform/linux/virtual_display.h"
+#endif
+
 using namespace std::literals;
 
 namespace nvhttp {
@@ -1348,6 +1352,9 @@ namespace nvhttp {
 
       if (revert_display_configuration) {
         display_device::revert_configuration();
+#ifdef SUNSHINE_BUILD_DRM
+        linux_vdisplay::end_capture();
+#endif
       }
     });
 
@@ -1382,6 +1389,25 @@ namespace nvhttp {
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
+
+#ifdef SUNSHINE_BUILD_DRM
+      if (config::video.linux_virtual_display_experimental) {
+        const auto &apps = proc::proc.get_apps();
+        auto app = std::find_if(apps.begin(), apps.end(), [&appid](const auto &ctx) {
+          return ctx.id == std::to_string(appid);
+        });
+        if (app != apps.end() && app->virtual_display) {
+          if (auto status = linux_vdisplay::begin_capture(launch_session->width, launch_session->height, launch_session->fps, launch_session->client_uuid); status != linux_vdisplay::status_e::OK) {
+            BOOST_LOG(error) << "Failed to create the virtual display, status "sv << static_cast<int>(status);
+            tree.put("root.<xmlattr>.status_code", 503);
+            tree.put("root.<xmlattr>.status_message", "Virtual display was not ready");
+            tree.put("root.gamesession", 0);
+
+            return;
+          }
+        }
+      }
+#endif
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
