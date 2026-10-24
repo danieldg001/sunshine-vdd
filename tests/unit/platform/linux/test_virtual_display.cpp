@@ -148,6 +148,24 @@ TEST(VirtualDisplayEdid, SerialIsStablePerClientAndDiffersBetweenClients) {
   EXPECT_NE(first, other);
 }
 
+TEST(VirtualDisplayEdid, SerialDiffersBetweenAppsOfTheSameClient) {
+  const mode_spec_t mode {2732, 2048, 60};
+  const std::string uuid = "0123ABCD-0000-0000-0000-000000000000";
+  auto desktop = decode_serial(make(mode, linux_vdisplay::display_identity(uuid, "Virtual Desktop")));
+  auto adapted = decode_serial(make(mode, linux_vdisplay::display_identity(uuid, "Desktop adaptado (monitor apagado)")));
+  auto desktop_again = decode_serial(make(mode, linux_vdisplay::display_identity(uuid, "Virtual Desktop")));
+  EXPECT_NE(desktop, adapted);
+  EXPECT_EQ(desktop, desktop_again);
+}
+
+TEST(VirtualDisplayIdentity, JoinsClientUuidAndAppName) {
+  EXPECT_EQ(linux_vdisplay::display_identity("abc", "Virtual Desktop"), "abc:Virtual Desktop");
+}
+
+TEST(VirtualDisplayIdentity, IsEmptyWithoutClientUuid) {
+  EXPECT_EQ(linux_vdisplay::display_identity("", "Virtual Desktop"), "");
+}
+
 TEST(VirtualDisplayEdid, SerialDoesNotDependOnMode) {
   auto a = decode_serial(make({2732, 2048, 60}, "client"));
   auto b = decode_serial(make({1920, 1080, 120}, "client"));

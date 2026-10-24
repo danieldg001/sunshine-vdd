@@ -1397,7 +1397,7 @@ namespace nvhttp {
           return ctx.id == std::to_string(appid);
         });
         if (app != apps.end() && app->virtual_display) {
-          if (auto status = linux_vdisplay::begin_capture(launch_session->width, launch_session->height, launch_session->fps, launch_session->client_uuid); status != linux_vdisplay::status_e::OK) {
+          if (auto status = linux_vdisplay::begin_capture(launch_session->width, launch_session->height, launch_session->fps, linux_vdisplay::display_identity(launch_session->client_uuid, app->name)); status != linux_vdisplay::status_e::OK) {
             BOOST_LOG(error) << "Failed to create the virtual display, status "sv << static_cast<int>(status);
             tree.put("root.<xmlattr>.status_code", 503);
             tree.put("root.<xmlattr>.status_message", "Virtual display was not ready");

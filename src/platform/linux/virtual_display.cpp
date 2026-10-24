@@ -192,21 +192,28 @@ namespace linux_vdisplay {
     }
   }
 
-  // We need to give each client a unique hash ID for the EDID serial.
-  // This lets compositors actually remember the vdisplay settings per client.
+  // We need to give each client and app a unique hash for the EDID serial.
+  // This lets compositors actually remember the vdisplay settings per client and app.
   // Uses FNV-1a.
   static uint32_t
-    hash_client_id(const std::string &client_id) {
+    hash_display_identity(const std::string &display_identity) {
     uint32_t hash = 0x811c9dc5;
-    for (auto c : client_id) {
+    for (auto c : display_identity) {
       hash ^= static_cast<uint8_t>(c);
       hash *= 0x01000193;
     }
     return hash;
   }
 
+  std::string display_identity(const std::string &client_uuid, const std::string &app_name) {
+    if (client_uuid.empty()) {
+      return {};
+    }
+    return client_uuid + ":" + app_name;
+  }
+
   std::array<uint8_t, 256>
-    generate_edid(int width, int height, int refresh_hz, const std::string &client_id) {
+    generate_edid(int width, int height, int refresh_hz, const std::string &display_identity) {
     std::array<uint8_t, 256> edid {};
 
     auto t = calculate_cvt_rb(width, height, refresh_hz);
@@ -237,8 +244,8 @@ namespace linux_vdisplay {
     // Product code
     edid[10] = 0x01;
     edid[11] = 0x00;
-    // Serial — hash of client ID for per-client display identity
-    uint32_t serial = client_id.empty() ? 1 : hash_client_id(client_id);
+    // Serial — hash of the client and app identity
+    uint32_t serial = display_identity.empty() ? 1 : hash_display_identity(display_identity);
     edid[12] = static_cast<uint8_t>(serial & 0xFF);
     edid[13] = static_cast<uint8_t>((serial >> 8) & 0xFF);
     edid[14] = static_cast<uint8_t>((serial >> 16) & 0xFF);
@@ -956,7 +963,7 @@ namespace linux_vdisplay {
   }
 
   static status_e
-    create_impl(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &client_id) {
+    create_impl(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &display_identity) {
     if (!is_supported_mode(width, height)) {
       BOOST_LOG(warning) << "[Experimental] Refusing "sv << width << "x"sv << height << " virtual display, each side must be "sv
                          << min_virtual_display_dimension << "-"sv << max_virtual_display_dimension << " pixels"sv;
@@ -1006,7 +1013,7 @@ namespace linux_vdisplay {
     active_state = active_state_t {conn, false, false};
 
     int refresh_hz = std::clamp((fps_millihertz + 500) / 1000, min_refresh_hz, max_refresh_hz);
-    auto edid = generate_edid(width, height, refresh_hz, client_id);
+    auto edid = generate_edid(width, height, refresh_hz, display_identity);
 
     // Record the override before applying it, so a crash at any later point can be recovered.
     if (!save_state(conn)) {
@@ -1022,7 +1029,7 @@ namespace linux_vdisplay {
     active_state->edid_written = true;
 
     BOOST_LOG(info) << "[Experimental] Generated EDID for "sv << width << "x"sv << height << "@"sv << refresh_hz << "Hz"sv
-                    << (client_id.empty() ? ""sv : " (client: "sv) << client_id << (client_id.empty() ? ""sv : ")"sv);
+                    << (display_identity.empty() ? ""sv : " (identity: "sv) << display_identity << (display_identity.empty() ? ""sv : ")"sv);
 
     if (!force_status(conn, "on")) {
       revert_failed_create(conn);
@@ -1048,9 +1055,9 @@ namespace linux_vdisplay {
   }
 
   status_e
-    create(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &client_id) {
+    create(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &display_identity) {
     try {
-      return create_impl(out_display_name, width, height, fps_millihertz, client_id);
+      return create_impl(out_display_name, width, height, fps_millihertz, display_identity);
     } catch (const std::exception &e) {
       BOOST_LOG(error) << "[Experimental] Virtual display creation threw: "sv << e.what();
       // The override may already be applied, so keep the state, marked as written, for remove() to clean up.
@@ -1127,9 +1134,9 @@ namespace linux_vdisplay {
   // The output_name that was configured before begin_capture() redirected it, empty when nothing is saved.
   static std::optional<std::string> saved_output_name;
 
-  status_e begin_capture(int width, int height, int fps_hz, const std::string &client_uuid) {
+  status_e begin_capture(int width, int height, int fps_hz, const std::string &display_identity) {
     std::string connector;
-    auto status = create(connector, width, height, refresh_millihertz_for_fps(fps_hz), client_uuid);
+    auto status = create(connector, width, height, refresh_millihertz_for_fps(fps_hz), display_identity);
     if (status != status_e::OK) {
       end_capture();
       return status;

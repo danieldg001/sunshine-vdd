@@ -100,10 +100,10 @@ namespace linux_vdisplay {
    * @param width Width in pixels.
    * @param height Height in pixels.
    * @param fps_millihertz Refresh rate in millihertz, clamped to 24-360 Hz.
-   * @param client_id Client identifier used to derive a stable EDID serial, may be empty.
+   * @param display_identity Identity of the client and app, as `display_identity()` builds it, used to derive a stable EDID serial. May be empty.
    * @return `status_e::OK` on success, otherwise the reason it failed.
    */
-  status_e create(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &client_id);
+  status_e create(std::string &out_display_name, int width, int height, int fps_millihertz, const std::string &display_identity);
 
   /**
    * @brief Remove the active virtual display, if any.
@@ -133,10 +133,21 @@ namespace linux_vdisplay {
    * @param width Width in pixels, the encoded preferred mode rounds it down to a multiple of 8.
    * @param height Height in pixels.
    * @param refresh_hz Refresh rate in Hz.
-   * @param client_id Client identifier hashed into the EDID serial. Empty selects a fixed serial.
+   * @param display_identity Identity hashed into the EDID serial, see `display_identity()`. Empty selects a fixed serial.
    * @return The 256 bytes of EDID.
    */
-  std::array<std::uint8_t, 256> generate_edid(int width, int height, int refresh_hz, const std::string &client_id);
+  std::array<std::uint8_t, 256> generate_edid(int width, int height, int refresh_hz, const std::string &display_identity);
+
+  /**
+   * @brief Build the identity a virtual display presents to the compositor.
+   *
+   * The identity is the client and the app together, so each app of a client gets its own monitor.
+   *
+   * @param client_uuid Certificate UUID of the client, empty when unknown.
+   * @param app_name Name of the app being launched.
+   * @return `<client_uuid>:<app_name>`, or an empty string when the client has no UUID.
+   */
+  std::string display_identity(const std::string &client_uuid, const std::string &app_name);
 
   /**
    * @brief Map a connector name to the output name kmsgrab matches against `output_name`.
@@ -161,10 +172,11 @@ namespace linux_vdisplay {
    * @param width Width in pixels.
    * @param height Height in pixels.
    * @param fps_hz Refresh rate in Hz.
-   * @param client_uuid Certificate UUID of the client, used to derive a stable EDID serial.
+   * @param display_identity Client and app identity from `display_identity()`. The EDID serial is derived from it, so
+   *        the compositor remembers scale and position per client and app. Empty selects a fixed serial.
    * @return The status of `create()`.
    */
-  status_e begin_capture(int width, int height, int fps_hz, const std::string &client_uuid);
+  status_e begin_capture(int width, int height, int fps_hz, const std::string &display_identity);
 
   /**
    * @brief Remove the virtual display, if any, and restore the `output_name` saved by `begin_capture()`.
