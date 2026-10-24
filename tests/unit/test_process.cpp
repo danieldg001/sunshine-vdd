@@ -8,6 +8,13 @@
 // standard includes
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <string>
+
+// platform includes
+#ifndef _WIN32
+  #include <stdlib.h>
+#endif
 
 // local includes
 #include <src/process.h>
@@ -312,3 +319,48 @@ TEST_F(ProcessRefreshTest, ParsesVirtualDisplayFlag) {
   EXPECT_TRUE(apps[0].virtual_display);
   EXPECT_FALSE(apps[1].virtual_display);
 }
+
+#ifndef _WIN32
+// Fixture that runs proc::proc.execute against a real apps.json and observes the environment
+// handed to a prep-cmd child process.
+class ProcessEnvTest: public BaseTest {
+protected:
+  void SetUp() override {
+    BaseTest::SetUp();
+    auto dir_template = (fs::temp_directory_path() / "sunshine_process_env_XXXXXX").string();  // NOSONAR(cpp:S5443): safe for tests
+    ASSERT_NE(mkdtemp(dir_template.data()), nullptr);
+    test_dir = dir_template;
+  }
+
+  void TearDown() override {
+    proc::proc.terminate();
+    proc::proc = proc::proc_t {{}, {}};
+    if (fs::exists(test_dir)) {
+      fs::remove_all(test_dir);
+    }
+    BaseTest::TearDown();
+  }
+
+  fs::path test_dir;
+};
+
+TEST_F(ProcessEnvTest, ExportsClientUuid) {
+  const auto env_file = test_dir / "env.txt";
+  const auto apps_path = test_dir / "apps.json";
+  std::ofstream(apps_path) << R"({"env": {}, "apps": [{"name": "Env", "prep-cmd": [{"do": "sh -c \"echo $SUNSHINE_CLIENT_UUID,$SUNSHINE_CLIENT_NAME > )" << env_file.string() << R"(\""}]}]})";
+
+  proc::refresh(apps_path.string());
+  ASSERT_EQ(proc::proc.get_apps().size(), 1u);
+
+  auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+  launch_session->client_uuid = "0123ABCD-0000-0000-0000-000000000000";
+  launch_session->client_name = "iPad";
+
+  ASSERT_EQ(proc::proc.execute(std::stoi(proc::proc.get_apps()[0].id), launch_session), 0);
+
+  std::ifstream env_stream(env_file);
+  std::string line;
+  std::getline(env_stream, line);
+  EXPECT_EQ(line, "0123ABCD-0000-0000-0000-000000000000,iPad");
+}
+#endif

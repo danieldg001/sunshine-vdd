@@ -201,6 +201,7 @@ namespace nvhttp {
   // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
   std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
   std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
+  std::string last_verified_client_uuid;  ///< UUID of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -512,6 +513,7 @@ namespace nvhttp {
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
     launch_session->client_cert = last_verified_client_cert;
     launch_session->client_name = last_verified_client_name;
+    launch_session->client_uuid = last_verified_client_uuid;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
@@ -1593,13 +1595,22 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Check whether a paired client certificate is allowed to connect and retrieve its friendly name.
+   * @brief Result of looking up a paired client certificate.
+   */
+  struct client_status_t {
+    bool enabled;  ///< Whether the client certificate belongs to an enabled device.
+    std::string name;  ///< Friendly client name set during pairing.
+    std::string uuid;  ///< Persistent Moonlight client UUID.
+  };
+
+  /**
+   * @brief Check whether a paired client certificate is allowed to connect and retrieve its friendly name and UUID.
    *
    * @param cert_pem PEM-encoded client certificate to look up.
-   * @return Pair of (bool enabled, string name) where "enabled" is True when the client certificate belongs to an
-             enabled device and "name" is the friendly client name set during pairing.
+   * @return Status where "enabled" is True when the client certificate belongs to an enabled device, "name" is the
+             friendly client name set during pairing and "uuid" is the persistent client UUID.
    */
-  std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
+  client_status_t get_client_status(const std::string_view cert_pem);
 
   void start() {
     platf::set_thread_name("nvhttp");
@@ -1660,7 +1671,7 @@ namespace nvhttp {
 
       // Check if this client is enabled
       auto pem = crypto::pem(x509);
-      auto [enabled, client_name] = get_client_status(pem);
+      auto [enabled, client_name, client_uuid] = get_client_status(pem);
       if (!enabled) {
         BOOST_LOG(info) << "Client is disabled -- denied"sv;
         return verified;
@@ -1668,6 +1679,7 @@ namespace nvhttp {
 
       last_verified_client_cert = pem;
       last_verified_client_name = client_name;
+      last_verified_client_uuid = client_uuid;
       verified = 1;
 
       return verified;
@@ -1797,16 +1809,16 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Check whether a paired client certificate is allowed to connect and return its friendly name.
+   * @brief Check whether a paired client certificate is allowed to connect and return its friendly name and UUID.
    */
-  std::pair<bool, std::string> get_client_status(const std::string_view cert_pem) {
+  client_status_t get_client_status(const std::string_view cert_pem) {
     const client_t &client = client_root;
     for (const auto &named_cert : client.named_devices) {
       if (named_cert.cert == cert_pem) {
-        return {named_cert.enabled, named_cert.name};
+        return {named_cert.enabled, named_cert.name, named_cert.uuid};
       }
     }
-    return {true, {}};
+    return {true, {}, {}};
   }
 
 #ifdef SUNSHINE_TESTS
