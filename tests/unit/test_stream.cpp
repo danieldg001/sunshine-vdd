@@ -22,6 +22,7 @@
 namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
   std::optional<std::pair<std::uint16_t, std::string_view>> parse_control_packet(const ENetPacket &packet);
+  std::optional<std::string_view> parse_input_data(std::string_view payload);
 }  // namespace stream
 
 TEST(ConcatAndInsertTests, ConcatNoInsertionTest) {
@@ -84,4 +85,50 @@ TEST(ControlPacketTests, AcceptsTypeAndPayload) {
   ASSERT_TRUE(message);
   EXPECT_EQ(message->first, 0x0206);
   EXPECT_EQ(message->second, "abc");
+}
+
+namespace {
+  // Build an IDX_INPUT_DATA payload: a big-endian length prefix followed by `body_size` bytes.
+  std::string make_input_payload(std::uint32_t declared_length, std::size_t body_size) {
+    std::string payload {
+      static_cast<char>(declared_length >> 24),
+      static_cast<char>(declared_length >> 16),
+      static_cast<char>(declared_length >> 8),
+      static_cast<char>(declared_length),
+    };
+    for (std::size_t i = 0; i < body_size; ++i) {
+      payload.push_back(static_cast<char>('a' + i % 26));
+    }
+    return payload;
+  }
+}  // namespace
+
+TEST(InputDataParseTests, RejectsMalformedLengths) {
+  EXPECT_EQ(stream::parse_input_data(std::string_view {}), std::nullopt);
+  EXPECT_EQ(stream::parse_input_data(std::string_view {"\0\0\0", 3}), std::nullopt);
+  EXPECT_EQ(stream::parse_input_data(std::string_view {"\0\0\0\0", 4}), std::nullopt);
+
+  // Declared length below the 16-byte GCM tag.
+  const auto too_short = make_input_payload(15, 32);
+  EXPECT_EQ(stream::parse_input_data(too_short), std::nullopt);
+
+  // Declared length far beyond the bytes actually present.
+  const auto huge = make_input_payload(0xFFFFFFFF, 32);
+  EXPECT_EQ(stream::parse_input_data(huge), std::nullopt);
+
+  // Declared length is three bytes more than the body holds.
+  const auto overrun = make_input_payload(32, 29);
+  EXPECT_EQ(stream::parse_input_data(overrun), std::nullopt);
+}
+
+TEST(InputDataParseTests, AcceptsExactAndTrailing) {
+  const auto exact = make_input_payload(16, 16);
+  const auto exact_view = stream::parse_input_data(exact);
+  ASSERT_TRUE(exact_view.has_value());
+  EXPECT_EQ(*exact_view, std::string_view {exact}.substr(4, 16));
+
+  const auto trailing = make_input_payload(32, 40);
+  const auto trailing_view = stream::parse_input_data(trailing);
+  ASSERT_TRUE(trailing_view.has_value());
+  EXPECT_EQ(*trailing_view, std::string_view {trailing}.substr(4, 32));
 }

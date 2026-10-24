@@ -656,6 +656,30 @@ namespace stream {
     };
   }
 
+  /**
+   * @brief Extract the tagged cipher from an `IDX_INPUT_DATA` payload.
+   *
+   * The payload is a big-endian length followed by that many bytes of GCM tag and ciphertext.
+   *
+   * @param payload Control message payload.
+   * @return The tagged cipher view, or `std::nullopt` when the length is shorter than the GCM tag
+   *         or longer than the bytes present.
+   */
+  std::optional<std::string_view> parse_input_data(std::string_view payload) {
+    std::int32_t length_prefix;
+    if (payload.size() < sizeof(length_prefix)) {
+      return std::nullopt;
+    }
+
+    std::memcpy(&length_prefix, payload.data(), sizeof(length_prefix));
+    const auto length = static_cast<std::uint32_t>(util::endian::big(length_prefix));
+    if (length < crypto::cipher::tag_size || length > payload.size() - sizeof(length_prefix)) {
+      return std::nullopt;
+    }
+
+    return payload.substr(sizeof(length_prefix), length);
+  }
+
   session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
     {
       // Fast path - look up existing session by peer
@@ -1212,14 +1236,19 @@ namespace stream {
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
-      auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
-      std::string_view tagged_cipher {payload.data() + sizeof(tagged_cipher_length), (size_t) tagged_cipher_length};
+      const auto tagged_cipher = parse_input_data(payload);
+      if (!tagged_cipher) {
+        BOOST_LOG(error) << "Malformed [IDX_INPUT_DATA] length"sv;
+
+        session::stop(*session);
+        return;
+      }
 
       std::vector<uint8_t> plaintext;
 
       auto &cipher = session->control.cipher;
       auto &iv = session->control.legacy_input_enc_iv;
-      if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
+      if (cipher.decrypt(*tagged_cipher, plaintext, &iv)) {
         // something went wrong :(
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
@@ -1228,8 +1257,8 @@ namespace stream {
         return;
       }
 
-      if (tagged_cipher_length >= 16 + iv.size()) {
-        std::copy(payload.end() - 16, payload.end(), std::begin(iv));
+      if (tagged_cipher->size() >= 16 + iv.size()) {
+        std::copy(tagged_cipher->end() - 16, tagged_cipher->end(), std::begin(iv));
       }
 
       input::passthrough(session->input, std::move(plaintext));

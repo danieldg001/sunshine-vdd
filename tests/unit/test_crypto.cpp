@@ -63,3 +63,16 @@ TEST(CryptoTest, CertificateChainRequiresExactPairedIdentity) {
   EXPECT_EQ(certificate_chain.verify(paired_certificate.get()), nullptr);
   EXPECT_NE(certificate_chain.verify(derived_certificate.get()), nullptr);
 }
+
+TEST(CryptoTest, GcmDecryptRejectsInputShorterThanTag) {
+  crypto::aes_t key(16, 0x42);
+  crypto::aes_t iv(16, 0x24);
+  crypto::cipher::gcm_t cipher {key, false};
+
+  const std::string short_input(15, 'x');
+  std::vector<std::uint8_t> plaintext;
+
+  int result = 0;
+  EXPECT_NO_THROW(result = cipher.decrypt(short_input, plaintext, &iv));
+  EXPECT_EQ(result, -1);
+}
