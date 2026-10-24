@@ -71,6 +71,58 @@ namespace {
     return t;
   }
 
+  struct type_i_t: dtd_t {
+    bool preferred;
+  };
+
+  /**
+   * @brief Decode a DisplayID 1.x Type I detailed timing: 20 bytes, every field stored minus one, little endian.
+   */
+  type_i_t decode_type_i(const edid_t &edid, std::size_t offset) {
+    const auto *d = &edid[offset];
+    auto field = [d](int at) {
+      return (d[at] | ((d[at + 1] & 0x7F) << 8)) + 1;
+    };
+    type_i_t t {};
+    t.pixel_clock_khz = ((d[0] | (d[1] << 8) | (d[2] << 16)) + 1) * 10;
+    t.preferred = (d[3] & 0x80) != 0;
+    t.h_active = field(4);
+    t.h_blanking = field(6);
+    t.v_active = field(12);
+    t.v_blanking = field(14);
+    return t;
+  }
+
+  double refresh_of(const dtd_t &t) {
+    return t.pixel_clock_khz * 1000.0 / ((t.h_active + t.h_blanking) * (t.v_active + t.v_blanking));
+  }
+
+  /**
+   * @brief Find the monitor range limits descriptor of the base block, or nullptr.
+   */
+  const std::uint8_t *find_range_limits(const edid_t &edid) {
+    for (std::size_t offset = 54; offset < 126; offset += 18) {
+      if (edid[offset] == 0 && edid[offset + 1] == 0 && edid[offset + 3] == 0xFD) {
+        return &edid[offset];
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Whether a timing is inside a range limits descriptor, with the EDID 1.4 +255 offset flags.
+   */
+  bool range_covers(const std::uint8_t *range, const dtd_t &t) {
+    int min_v = range[5] + ((range[4] & 0x01) ? 255 : 0);
+    int max_v = range[6] + ((range[4] & 0x02) ? 255 : 0);
+    int min_h_khz = range[7] + ((range[4] & 0x04) ? 255 : 0);
+    int max_h_khz = range[8] + ((range[4] & 0x08) ? 255 : 0);
+    double refresh = refresh_of(t);
+    double h_rate_khz = static_cast<double>(t.pixel_clock_khz) / (t.h_active + t.h_blanking);
+    return min_v <= refresh && refresh <= max_v && min_h_khz <= h_rate_khz && h_rate_khz <= max_h_khz &&
+           t.pixel_clock_khz <= range[9] * 10000;
+  }
+
   std::uint32_t decode_serial(const edid_t &edid) {
     return edid[12] | (edid[13] << 8) | (edid[14] << 16) | (static_cast<std::uint32_t>(edid[15]) << 24);
   }
@@ -121,22 +173,67 @@ TEST(VirtualDisplayEdid, PreferredModeTimingMatchesRequestedRefresh) {
     auto edid = make(m);
     auto t = decode_dtd(edid, 54);
     ASSERT_GT(t.pixel_clock_khz, 0);
-    double refresh = t.pixel_clock_khz * 1000.0 / ((t.h_active + t.h_blanking) * (t.v_active + t.v_blanking));
+    double refresh = refresh_of(t);
     EXPECT_NEAR(refresh, m.refresh_hz, 0.5);
   }
 }
 
-TEST(VirtualDisplayEdid, PreferredModeNeverExceedsRequestedRefreshWhenPixelClockOverflows) {
-  // The DTD pixel clock is 16 bits in units of 10 kHz (at most 655.35 MHz), so 4K at 240 Hz cannot be encoded as asked.
-  auto edid = make({3840, 2160, 240});
-  auto t = decode_dtd(edid, 54);
-  ASSERT_GT(t.pixel_clock_khz, 0);
-  double refresh = t.pixel_clock_khz * 1000.0 / ((t.h_active + t.h_blanking) * (t.v_active + t.v_blanking));
-  EXPECT_GT(refresh, 0.0);
-  EXPECT_LE(refresh, 240.0);
-  for (std::size_t block = 0; block < edid.size() / 128; ++block) {
-    EXPECT_EQ(block_sum(edid, block * 128, 128), 0) << "block " << block;
+TEST(VirtualDisplayEdid, ModeThatFitsTheDtdStaysInTheBaseBlockWithoutDisplayId) {
+  auto edid = make({2732, 2048, 60});
+  auto preferred = decode_dtd(edid, 54);
+  EXPECT_EQ(preferred.h_active, 2728);
+  EXPECT_EQ(preferred.v_active, 2048);
+  EXPECT_NEAR(refresh_of(preferred), 60.0, 0.5);
+  EXPECT_NE(edid[128], 0x70) << "no DisplayID extension";
+}
+
+TEST(VirtualDisplayEdid, ModeOverTheDtdPixelClockGoesWholeToADisplayIdTypeITiming) {
+  // The DTD pixel clock is 16 bits in units of 10 kHz (at most 655.35 MHz): these modes need DisplayID.
+  const mode_spec_t overflowing[] = {{2732, 2048, 120}, {3840, 2160, 240}, {1920, 1080, 360}};
+  for (const auto &m : overflowing) {
+    SCOPED_TRACE(std::to_string(m.width) + "x" + std::to_string(m.height) + "@" + std::to_string(m.refresh_hz));
+    auto edid = make(m);
+    EXPECT_EQ(edid[126], 1);
+    EXPECT_EQ(block_sum(edid, 0, 128), 0);
+    EXPECT_EQ(block_sum(edid, 128, 128), 0);
+
+    EXPECT_EQ(edid[128], 0x70) << "DisplayID extension tag";
+    EXPECT_EQ(edid[129], 0x12) << "DisplayID 1.2";
+    ASSERT_EQ(edid[130], 121) << "section payload bytes";
+    EXPECT_EQ(block_sum(edid, 129, 5 + 121), 0) << "section checksum";
+    EXPECT_EQ(edid[133], 0x03) << "Type I detailed timing data block";
+    ASSERT_EQ(edid[135], 20) << "one Type I descriptor";
+
+    auto t = decode_type_i(edid, 136);
+    EXPECT_TRUE(t.preferred);
+    EXPECT_EQ(t.h_active, m.width & ~7);
+    EXPECT_EQ(t.v_active, m.height);
+    EXPECT_NEAR(refresh_of(t), m.refresh_hz, m.refresh_hz * 0.01);
+
+    auto base = decode_dtd(edid, 54);
+    EXPECT_FALSE(base.h_active == t.h_active && base.v_active == t.v_active) << "base DTD must not offer the same resolution at fewer Hz";
   }
+}
+
+TEST(VirtualDisplayEdid, RangeLimitsCoverTheFallbackAndTheDisplayIdMode) {
+  auto edid = make({2732, 2048, 120});
+  const auto *range = find_range_limits(edid);
+  ASSERT_NE(range, nullptr);
+  EXPECT_TRUE(range_covers(range, decode_dtd(edid, 54))) << "fallback DTD";
+  EXPECT_TRUE(range_covers(range, decode_type_i(edid, 136))) << "DisplayID mode";
+}
+
+TEST(VirtualDisplayEdid, RangeLimitsThatCannotBeEncodedAreLeftOut) {
+  // 4695 MHz and 1105 kHz are over the 2550 MHz and 510 kHz the range limits descriptor can hold.
+  auto edid = make({4095, 4095, 240});
+  ASSERT_EQ(edid[128], 0x70);
+  const auto *range = find_range_limits(edid);
+  if (range != nullptr) {
+    EXPECT_TRUE(range_covers(range, decode_type_i(edid, 136)));
+  } else {
+    EXPECT_EQ(edid[24] & 0x01, 0) << "continuous frequency needs a range limits descriptor";
+  }
+  EXPECT_EQ(block_sum(edid, 0, 128), 0);
 }
 
 TEST(VirtualDisplayEdid, SerialIsStablePerClientAndDiffersBetweenClients) {
@@ -329,8 +426,10 @@ TEST(VirtualDisplayMode, RejectsModesTheEdidCannotEncode) {
 }
 
 TEST(VirtualDisplayEdid, LargestSupportedModeIsEncodedExactly) {
+  // Its pixel clock is over what a DTD holds, so the mode is the DisplayID timing.
   auto edid = make({4095, 4095, 60});
-  auto preferred = decode_dtd(edid, 54);
+  ASSERT_EQ(edid[128], 0x70);
+  auto preferred = decode_type_i(edid, 136);
   EXPECT_EQ(preferred.h_active, 4088);
   EXPECT_EQ(preferred.v_active, 4095);
   for (std::size_t block = 0; block < edid.size() / 128; ++block) {

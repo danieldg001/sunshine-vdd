@@ -172,24 +172,114 @@ namespace linux_vdisplay {
     }
   }
 
-  static void
-    build_range_limits(uint8_t desc[18], int min_v, int max_v, int max_pclk_mhz, const cvt_timing_t &t) {
-    desc[0] = desc[1] = desc[2] = 0x00;
+  /**
+   * @brief Pack the monitor range limits descriptor, or a dummy descriptor when a limit cannot be encoded.
+   *
+   * EDID 1.4 adds 255 to a rate whose offset flag is set in byte 4, so rates fit up to 510 and the pixel clock
+   * up to 2550 MHz. A descriptor that cannot hold a limit would exclude the modes past it, so none is written.
+   *
+   * @param desc The 18 descriptor bytes to fill.
+   * @param min_v Minimum vertical rate in Hz.
+   * @param max_v Maximum vertical rate in Hz.
+   * @param min_h_khz Minimum horizontal rate in kHz.
+   * @param max_h_khz Maximum horizontal rate in kHz.
+   * @param max_pclk_mhz Maximum pixel clock in MHz.
+   * @return Whether the range limits were written.
+   */
+  static bool
+    build_range_limits(uint8_t desc[18], int min_v, int max_v, int min_h_khz, int max_h_khz, int max_pclk_mhz) {
+    std::fill(desc, desc + 18, 0);
+    int pclk_10mhz = (max_pclk_mhz + 9) / 10;
+    if (std::max(max_v, max_h_khz) > 510 || std::min(min_v, min_h_khz) < 1 || pclk_10mhz > 255) {
+      desc[3] = 0x10;  // EDID descriptor tag: dummy
+      return false;
+    }
+
     desc[3] = 0xFD;  // EDID descriptor tag: monitor range limits
-    desc[4] = 0x00;
-    desc[5] = static_cast<uint8_t>(std::clamp(min_v, 1, 255));
-    desc[6] = static_cast<uint8_t>(std::clamp(max_v, 1, 255));
-
-    int h_rate_khz = static_cast<int>(t.pixel_clock_khz / t.h_total);
-    desc[7] = static_cast<uint8_t>(std::clamp(h_rate_khz - 1, 1, 255));
-    desc[8] = static_cast<uint8_t>(std::clamp(h_rate_khz + 1, 1, 255));
-
-    desc[9] = static_cast<uint8_t>(std::clamp((max_pclk_mhz + 9) / 10, 1, 255));
+    auto rate = [&desc](int value, uint8_t offset_flag) {
+      if (value > 255) {
+        desc[4] |= offset_flag;
+        value -= 255;
+      }
+      return static_cast<uint8_t>(value);
+    };
+    desc[5] = rate(min_v, 0x01);
+    desc[6] = rate(max_v, 0x02);
+    desc[7] = rate(min_h_khz, 0x04);
+    desc[8] = rate(max_h_khz, 0x08);
+    desc[9] = static_cast<uint8_t>(pclk_10mhz);
     desc[10] = 0x01;  // default GTF timing type
     desc[11] = 0x0A;  // LF terminator
     for (int i = 12; i < 18; i++) {
       desc[i] = 0x20;  // space padding
     }
+    return true;
+  }
+
+  /**
+   * @brief Get the aspect ratio code of a DisplayID 1.x Type I timing.
+   *
+   * @param width Width in pixels.
+   * @param height Height in pixels.
+   * @return The code of the listed ratio within 1% of width:height, or 8 (undefined).
+   */
+  static uint8_t
+    displayid_aspect(int width, int height) {
+    constexpr std::array<std::pair<int, int>, 8> ratios {{{1, 1}, {5, 4}, {4, 3}, {15, 9}, {16, 9}, {16, 10}, {64, 27}, {256, 135}}};
+    for (size_t code = 0; code < ratios.size(); code++) {
+      auto [w, h] = ratios[code];
+      if (std::abs(width * h - height * w) * 100 <= height * w) {
+        return static_cast<uint8_t>(code);
+      }
+    }
+    return 8;
+  }
+
+  /**
+   * @brief Pack a timing as the preferred Type I detailed timing of a DisplayID 1.2 extension block.
+   *
+   * This is the layout NVIDIA's driver reads: it ignores DisplayID 2.0 Type VII timings.
+   *
+   * @param ext The 128 extension block bytes to fill, zeroed beforehand.
+   * @param t The timing.
+   * @param width Width in pixels, for the aspect ratio.
+   * @param height Height in pixels, for the aspect ratio.
+   */
+  static void
+    build_displayid_extension(uint8_t ext[128], const cvt_timing_t &t, int width, int height) {
+    constexpr int section_bytes = 121;  // the whole block, as real monitors and NVIDIA expect
+    ext[0] = 0x70;  // DisplayID extension tag
+    ext[1] = 0x12;  // DisplayID 1.2
+    ext[2] = section_bytes;
+    ext[3] = 0x03;  // product type: standalone display
+    ext[4] = 0x00;  // extension count
+
+    uint8_t *block = &ext[5];
+    block[0] = 0x03;  // Type I detailed timing data block
+    block[1] = 0x01;
+    block[2] = 20;
+
+    // Every field is stored minus one, little endian; the pixel clock in units of 10 kHz.
+    uint8_t *d = &block[3];
+    auto put = [d](int at, uint32_t value, int bytes) {
+      for (int i = 0; i < bytes; i++) {
+        d[at + i] = static_cast<uint8_t>(value >> (8 * i));
+      }
+    };
+    put(0, t.pixel_clock_khz / 10 - 1, 3);
+    d[3] = 0x80 | displayid_aspect(width, height);  // preferred, progressive, no stereo
+    put(4, t.h_active - 1, 2);
+    put(6, t.h_blanking - 1, 2);
+    put(8, (t.h_front_porch - 1) | 0x8000, 2);  // H+
+    put(10, t.h_sync_width - 1, 2);
+    put(12, t.v_active - 1, 2);
+    put(14, t.v_blanking - 1, 2);
+    put(16, t.v_front_porch - 1, 2);  // V-
+    put(18, t.v_sync_width - 1, 2);
+
+    // The rest of the section is zero padding, then the section and block checksums.
+    ext[5 + section_bytes] = edid_checksum(&ext[1], 4 + section_bytes + 1);
+    ext[127] = edid_checksum(ext, 128);
   }
 
   // We need to give each client and app a unique hash for the EDID serial.
@@ -218,15 +308,9 @@ namespace linux_vdisplay {
 
     auto t = calculate_cvt_rb(width, height, refresh_hz);
 
-    // DTD pixel clock field is 16-bit (units of 10 kHz), clamp refresh if it overflows
-    uint32_t pclk_10khz = t.pixel_clock_khz / 10;
-    if (pclk_10khz > 65535) {
-      int max_refresh = static_cast<int>(65535ULL * 10000 / (static_cast<uint64_t>(t.h_total) * t.v_total));
-      BOOST_LOG(warning) << "[Experimental] Pixel clock overflow for "sv << width << "x"sv << height
-                         << "@"sv << refresh_hz << "Hz, clamping to "sv << max_refresh << "Hz"sv;
-      refresh_hz = max_refresh;
-      t = calculate_cvt_rb(width, height, refresh_hz);
-    }
+    // The DTD pixel clock is 16 bits in units of 10 kHz. A mode over it goes whole to a DisplayID
+    // extension, and the base block offers another resolution, never the same one at fewer Hz.
+    const bool needs_displayid = t.pixel_clock_khz / 10 > 0xFFFF;
 
     // Physical size in mm since EDID must report it.
     int h_mm = static_cast<int>(width * 25.4 / 96.0 + 0.5);
@@ -290,11 +374,16 @@ namespace linux_vdisplay {
       edid[i + 1] = 0x01;
     }
 
-    // DTD1: preferred mode (target resolution)
-    build_dtd(&edid[54], t, h_mm, v_mm);
+    // DTD1: preferred mode (target resolution), or the fallback when the target is in DisplayID
+    auto t_base = t;
+    if (needs_displayid) {
+      bool is_1080p = t.h_active == 1920 && t.v_active == 1080;
+      t_base = is_1080p ? calculate_cvt_rb(1280, 720, 60) : calculate_cvt_rb(1920, 1080, 60);
+    }
+    build_dtd(&edid[54], t_base, h_mm, v_mm);  // the image size is the display's
 
-    // DTD2: 1080p@60 fallback (if primary isn't already 1080p@60)
-    if (width != 1920 || height != 1080 || refresh_hz != 60) {
+    // DTD2: 1080p@60 fallback (if primary isn't already 1080p@60 or in DisplayID)
+    if (!needs_displayid && (width != 1920 || height != 1080 || refresh_hz != 60)) {
       auto t_fallback = calculate_cvt_rb(1920, 1080, 60);
       int fb_h_mm = static_cast<int>(1920 * 25.4 / 96.0 + 0.5);
       int fb_v_mm = static_cast<int>(1080 * 25.4 / 96.0 + 0.5);
@@ -321,12 +410,24 @@ namespace linux_vdisplay {
     int min_v = std::min(refresh_hz - 1, 24);
     int max_v = std::max(refresh_hz, 144);
     int max_pclk_mhz = static_cast<int>(t.pixel_clock_khz / 1000) + 10;
-    build_range_limits(&edid[108], min_v, max_v, max_pclk_mhz, t);
+    // Horizontal rates of the base DTD and the target, which are the same timing unless the target is in DisplayID
+    int h_base_khz = static_cast<int>(t_base.pixel_clock_khz / t_base.h_total);
+    int h_target_khz = static_cast<int>(t.pixel_clock_khz / t.h_total);
+    int min_h_khz = std::min(h_base_khz, h_target_khz) - 1;
+    int max_h_khz = std::max(h_base_khz, h_target_khz) + 1;
+    if (!build_range_limits(&edid[108], min_v, max_v, min_h_khz, max_h_khz, max_pclk_mhz)) {
+      edid[24] &= ~0x01;  // continuous frequency requires a range limits descriptor
+    }
 
     // Extension count
     edid[126] = 0x01;
     // Checksum
     edid[127] = edid_checksum(&edid[0], 128);
+
+    if (needs_displayid) {
+      build_displayid_extension(&edid[128], t, width, height);
+      return edid;
+    }
 
     // --- CTA extension block (bytes 128-255) ---
     edid[128] = 0x02;  // CTA extension tag
