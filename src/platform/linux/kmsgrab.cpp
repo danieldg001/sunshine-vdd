@@ -855,6 +855,49 @@ namespace platf {
       }
 
       /**
+       * @brief Return the framebuffer on a plane with a single ioctl.
+       *
+       * @param id DRM plane ID.
+       * @return Framebuffer ID, or 0 when the plane has none or the query fails.
+       */
+      std::uint32_t plane_fb_id(std::uint32_t id) {
+        drm_mode_get_plane plane {};
+        plane.plane_id = id;
+        if (drmIoctl(fd.el, DRM_IOCTL_MODE_GETPLANE, &plane)) {
+          return 0;
+        }
+        return plane.fb_id;
+      }
+
+      /**
+       * @brief Return the values of a plane's properties, in the order of `plane_props()`, usually with a single ioctl.
+       *
+       * @param id DRM plane ID.
+       * @return Property values, or none when the query fails.
+       */
+      std::vector<std::uint64_t> plane_prop_values(std::uint32_t id) {
+        std::vector<std::uint32_t> ids(32);
+        std::vector<std::uint64_t> values(ids.size());
+        while (true) {
+          drm_mode_obj_get_properties request {};
+          request.obj_id = id;
+          request.obj_type = DRM_MODE_OBJECT_PLANE;
+          request.count_props = ids.size();
+          request.props_ptr = reinterpret_cast<std::uintptr_t>(ids.data());
+          request.prop_values_ptr = reinterpret_cast<std::uintptr_t>(values.data());
+          if (drmIoctl(fd.el, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &request)) {
+            return {};
+          }
+          if (request.count_props <= ids.size()) {
+            values.resize(request.count_props);
+            return values;
+          }
+          ids.resize(request.count_props);
+          values.resize(request.count_props);
+        }
+      }
+
+      /**
        * @brief Return DRM plane properties.
        *
        * @param id DRM plane ID.
@@ -1355,7 +1398,9 @@ namespace platf {
         std::optional<std::uint64_t> prop_src_h;
 
         auto props = card.plane_props(cursor_plane_id);
+        captured_cursor_props.clear();
         for (auto &[prop, val] : props) {
+          captured_cursor_props.push_back(val);
           if (prop->name == "CRTC_X"sv) {
             prop_crtc_x = val;
           } else if (prop->name == "CRTC_Y"sv) {
@@ -1583,8 +1628,66 @@ namespace platf {
         }
 
         update_cursor();
+        captured_fb_id = plane->fb_id;
 
         return capture_e::ok;
+      }
+
+      /**
+       * @brief Capture each frame the display presents, as paced by `pace_frame()`.
+       *
+       * Probes the primary and cursor planes every `frame_probe_interval` instead of sampling the
+       * plane on a fixed timer, so a display flipping at the stream rate is captured once per flip.
+       * The schedule proposed by `pace_frame()` is kept only when the snapshot succeeds; after a
+       * snapshot that finds no framebuffer the schedule stays as it was and the loop probes again one
+       * probe interval later.
+       *
+       * @tparam snapshot_t Callable taking `std::shared_ptr<platf::img_t> &` and returning `capture_e`.
+       * @param push_captured_image_cb Callback that hands a captured image to the encoders.
+       * @param cursor Whether the cursor is captured; cursor plane changes count as new frames only then.
+       * @param snapshot Captures the current frame into the image it is given and returns the capture status.
+       * @return Capture status that ended the loop.
+       */
+      template<typename snapshot_t>
+      capture_e capture_presented_frames(const push_captured_image_cb_t &push_captured_image_cb, const bool *cursor, snapshot_t &&snapshot) {
+        frame_pacing_t pacing {};
+        captured_fb_id = 0;
+
+        while (true) {
+          auto now = std::chrono::steady_clock::now();
+          bool cursor_changed = *cursor && cursor_plane_id >= 0 && card.plane_prop_values(cursor_plane_id) != captured_cursor_props;
+          auto decision = pace_frame(pacing, captured_fb_id, card.plane_fb_id(plane_id), cursor_changed, now, delay);
+          if (decision.action == frame_action_e::wait) {
+            std::this_thread::sleep_until(frame_wait_deadline(pacing, now));
+            continue;
+          }
+
+          std::shared_ptr<platf::img_t> img_out;
+          auto status = snapshot(img_out);
+          if (status == platf::capture_e::ok) {
+            pacing = decision.pacing;
+          }
+          switch (status) {
+            case platf::capture_e::reinit:
+            case platf::capture_e::error:
+            case platf::capture_e::interrupted:
+              return status;
+            case platf::capture_e::timeout:
+              if (!push_captured_image_cb(std::move(img_out), false)) {
+                return platf::capture_e::ok;
+              }
+              std::this_thread::sleep_until(frame_wait_deadline(pacing, now));
+              break;
+            case platf::capture_e::ok:
+              if (!push_captured_image_cb(std::move(img_out), true)) {
+                return platf::capture_e::ok;
+              }
+              break;
+            default:
+              BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
+              return status;
+          }
+        }
       }
 
       mem_type_e mem_type;  ///< Mem type.
@@ -1605,6 +1708,8 @@ namespace platf {
 
       int cursor_plane_id;  ///< Cursor plane ID.
       cursor_t captured_cursor {};  ///< Captured cursor.
+      std::vector<std::uint64_t> captured_cursor_props;  ///< Cursor plane property values at the last capture.
+      std::uint32_t captured_fb_id = 0;  ///< Primary plane framebuffer at the last capture.
 
       card_t card;  ///< Card.
     };
@@ -1662,37 +1767,9 @@ namespace platf {
       }
 
       capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
-        auto next_frame = std::chrono::steady_clock::now();
-
-        sleep_overshoot_logger.reset();
-
-        while (true) {
-          platf::handle_pacing(next_frame, delay, sleep_overshoot_logger);
-
-          std::shared_ptr<platf::img_t> img_out;
-          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
-          switch (status) {
-            case platf::capture_e::reinit:
-            case platf::capture_e::error:
-            case platf::capture_e::interrupted:
-              return status;
-            case platf::capture_e::timeout:
-              if (!push_captured_image_cb(std::move(img_out), false)) {
-                return platf::capture_e::ok;
-              }
-              break;
-            case platf::capture_e::ok:
-              if (!push_captured_image_cb(std::move(img_out), true)) {
-                return platf::capture_e::ok;
-              }
-              break;
-            default:
-              BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
-              return status;
-          }
-        }
-
-        return capture_e::ok;
+        return capture_presented_frames(push_captured_image_cb, cursor, [&](std::shared_ptr<platf::img_t> &img_out) {
+          return snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
+        });
       }
 
       /**
@@ -1928,37 +2005,9 @@ namespace platf {
       }
 
       capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
-        auto next_frame = std::chrono::steady_clock::now();
-
-        sleep_overshoot_logger.reset();
-
-        while (true) {
-          platf::handle_pacing(next_frame, delay, sleep_overshoot_logger);
-
-          std::shared_ptr<platf::img_t> img_out;
-          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
-          switch (status) {
-            case platf::capture_e::reinit:
-            case platf::capture_e::error:
-            case platf::capture_e::interrupted:
-              return status;
-            case platf::capture_e::timeout:
-              if (!push_captured_image_cb(std::move(img_out), false)) {
-                return platf::capture_e::ok;
-              }
-              break;
-            case platf::capture_e::ok:
-              if (!push_captured_image_cb(std::move(img_out), true)) {
-                return platf::capture_e::ok;
-              }
-              break;
-            default:
-              BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
-              return status;
-          }
-        }
-
-        return capture_e::ok;
+        return capture_presented_frames(push_captured_image_cb, cursor, [&](std::shared_ptr<platf::img_t> &img_out) {
+          return snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
+        });
       }
 
       /**
