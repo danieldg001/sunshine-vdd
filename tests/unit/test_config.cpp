@@ -124,3 +124,41 @@ TEST_F(ConfigPersistenceTest, SelectsAllDriversOnlyForLicensedUsersWithoutAPrefe
   EXPECT_FALSE(config::select_all_gamepad_drivers_if_licensed(true));
   EXPECT_EQ(file_handler::read_file(config_file().string().c_str()), "gamepad_driver = all\n");
 }
+
+/**
+ * @brief Restores the global video configuration around virtual display option parsing.
+ */
+struct ConfigParseTest: BaseTest {
+  void SetUp() override {
+    BaseTest::SetUp();
+    original_video_ = config::video;
+    original_modified_config_settings_ = config::modified_config_settings;
+  }
+
+  void TearDown() override {
+    config::video = std::move(original_video_);
+    config::modified_config_settings = std::move(original_modified_config_settings_);
+    BaseTest::TearDown();
+  }
+
+private:
+  config::video_t original_video_;  ///< Video configuration restored after each test.
+  decltype(config::modified_config_settings) original_modified_config_settings_;  ///< Modified settings restored after each test.
+};
+
+TEST_F(ConfigParseTest, ParsesLinuxVirtualDisplayOptions) {
+  config::apply_config_for_test(
+    "linux_virtual_display_experimental = enabled\n"
+    "vdisplay_connector = card1-DP-2\n"
+  );
+
+  EXPECT_TRUE(config::video.linux_virtual_display_experimental);
+  EXPECT_EQ(config::video.vdisplay_connector, "card1-DP-2");
+}
+
+TEST_F(ConfigParseTest, LinuxVirtualDisplayOptionsDefaultToOff) {
+  config::apply_config_for_test("");
+
+  EXPECT_FALSE(config::video.linux_virtual_display_experimental);
+  EXPECT_TRUE(config::video.vdisplay_connector.empty());
+}

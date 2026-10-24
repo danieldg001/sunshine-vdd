@@ -96,6 +96,26 @@ const config = ref(props.config)
         :config="config"
     />
 
+    <!-- Linux Virtual Display (Experimental) -->
+    <PlatformLayout :platform="platform">
+      <template #linux>
+        <Checkbox class="mb-3"
+                  id="linux_virtual_display_experimental"
+                  locale-prefix="config"
+                  v-model="config.linux_virtual_display_experimental"
+                  default="false"
+        ></Checkbox>
+
+        <div class="mb-3" v-if="config.linux_virtual_display_experimental === 'enabled'">
+          <label for="vdisplay_connector" class="form-label">{{ $t('config.vdisplay_connector') }}</label>
+          <input type="text" class="form-control" id="vdisplay_connector"
+                 placeholder="card1-DP-2"
+                 v-model="config.vdisplay_connector" />
+          <div class="form-text">{{ $t('config.vdisplay_connector_desc') }}</div>
+        </div>
+      </template>
+    </PlatformLayout>
+
   </div>
 </template>
 

@@ -1494,6 +1494,52 @@ supported on the current platform.
     </tr>
 </table>
 
+### linux_virtual_display_experimental
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Enable experimental virtual display support on Linux using a DRM EDID override. Requires a GPU with an available disconnected connector. NVIDIA GPUs may have limited compatibility. When enabled, apps that request a virtual display can stream from it instead of an existing monitor.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            linux_virtual_display_experimental = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### vdisplay_connector
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The GPU connector to use for the virtual display, in the form shown by the DRM subsystem (e.g. `card1-DP-2`). Leave empty to auto-select the first available disconnected connector. Only used when `linux_virtual_display_experimental` is enabled.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            (empty)
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            vdisplay_connector = card1-DP-2
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp
