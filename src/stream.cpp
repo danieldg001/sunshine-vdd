@@ -1591,6 +1591,7 @@ namespace stream {
         break;
       }
 
+      const auto source_timestamp = packet->frame_timestamp;
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
@@ -1874,6 +1875,9 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+        BOOST_LOG(debug) << "Capture timing: stage=send_end frame=" << packet->frame_index()
+                         << " source_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(source_timestamp.value_or(std::chrono::steady_clock::time_point {}).time_since_epoch()).count()
+                         << " ready_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);

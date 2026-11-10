@@ -1815,6 +1815,7 @@ namespace video {
 
   /**
    * @brief Drain encoded packets from an FFmpeg encoder session.
+   * Debug timing records preserve the capture timestamp for correlation with conversion and transmission.
    *
    * @param frame_nr Monotonic frame index assigned by the video pipeline.
    * @param session Active FFmpeg encoder session.
@@ -1891,6 +1892,9 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
+      BOOST_LOG(debug) << "Capture timing: stage=encoded frame=" << packet->frame_index()
+                       << " source_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(packet->frame_timestamp.value_or(std::chrono::steady_clock::time_point {}).time_since_epoch()).count()
+                       << " ready_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
       packets->raise(std::move(packet));
     }
 
@@ -2475,10 +2479,15 @@ namespace video {
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
           frame_timestamp = img->frame_timestamp;
+          const auto convert_started = std::chrono::steady_clock::now();
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
+          BOOST_LOG(debug) << "Capture timing: stage=converted frame=" << frame_nr
+                           << " source_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(frame_timestamp.value_or(std::chrono::steady_clock::time_point {}).time_since_epoch()).count()
+                           << " begin_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(convert_started.time_since_epoch()).count()
+                           << " ready_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         } else if (!images->running()) {
           break;
         }

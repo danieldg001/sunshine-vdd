@@ -1641,6 +1641,7 @@ namespace platf {
        * The schedule proposed by `pace_frame()` is kept only when the snapshot succeeds; after a
        * snapshot that finds no framebuffer the schedule stays as it was and the loop probes again one
        * probe interval later.
+       * Debug timing records distinguish new-frame and repeat decisions using the image's capture timestamp.
        *
        * @tparam snapshot_t Callable taking `std::shared_ptr<platf::img_t> &` and returning `capture_e`.
        * @param push_captured_image_cb Callback that hands a captured image to the encoders.
@@ -1666,6 +1667,13 @@ namespace platf {
           auto status = snapshot(img_out);
           if (status == platf::capture_e::ok) {
             pacing = decision.pacing;
+            if (img_out && img_out->frame_timestamp) {
+              BOOST_LOG(debug) << "Capture timing: stage=kms source_ns="
+                               << std::chrono::duration_cast<std::chrono::nanoseconds>(img_out->frame_timestamp->time_since_epoch()).count()
+                               << " framebuffer=" << captured_fb_id
+                               << " repeat=" << (decision.action == frame_action_e::repeat)
+                               << " ready_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
           }
           switch (status) {
             case platf::capture_e::reinit:
