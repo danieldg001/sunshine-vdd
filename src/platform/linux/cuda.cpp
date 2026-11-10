@@ -1184,7 +1184,9 @@ namespace cuda {
         rgb = std::move(*rgb_opt);
       }
 
-      sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0], is_yuv444);
+      if (sws.load_vram(descriptor, offset_x, offset_y, rgb->tex[0], is_yuv444)) {
+        return -1;
+      }
 
       const int plane_count = is_yuv444 ? 3 : 2;
       const gl_cuda_frame_copy_t copy {

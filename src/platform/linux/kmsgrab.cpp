@@ -3,6 +3,7 @@
  * @brief Definitions for KMS screen capture.
  */
 // standard includes
+#include <climits>
 #include <errno.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -558,6 +559,16 @@ namespace platf {
       std::uint32_t src_h;  ///< Src h.
       std::vector<std::uint8_t> pixels;  ///< Pixels.
       unsigned long serial;  ///< Serial.
+      std::shared_ptr<const egl::cursor_surface_t> surface;  ///< Exported GPU cursor, when supported by the consumer.
+
+      /**
+       * @brief Hide the cursor and release its exported DMA-BUF.
+       */
+      void hide() {
+        visible = false;
+        surface.reset();
+        fb_id = 0;
+      }
 
       // Private properties used for tracking cursor changes
       std::uint64_t prop_src_x;  ///< Prop src x.
@@ -1077,6 +1088,14 @@ namespace platf {
       }
 
       /**
+       * @brief Whether this capture backend can pass a cursor DMA-BUF to its converter.
+       * @return True when the consumer supports external cursor sampling.
+       */
+      virtual bool uses_gpu_cursor() const {
+        return false;
+      }
+
+      /**
        * @brief Initialize the base KMS capture state for the selected monitor.
        *
        * @param display_name Display name.
@@ -1386,6 +1405,10 @@ namespace platf {
         }
 
         plane_t plane = drmModeGetPlane(card.fd.el, cursor_plane_id);
+        if (!plane) {
+          captured_cursor.hide();
+          return;
+        }
 
         std::optional<std::int32_t> prop_crtc_x;
         std::optional<std::int32_t> prop_crtc_y;
@@ -1424,14 +1447,14 @@ namespace platf {
           BOOST_LOG(error) << "Cursor plane is missing required plane CRTC properties!"sv;
           BOOST_LOG(error) << "Atomic mode-setting must be enabled to capture the cursor!"sv;
           cursor_plane_id = -1;
-          captured_cursor.visible = false;
+          captured_cursor.hide();
           return;
         }
         if (!prop_src_x || !prop_src_y || !prop_src_w || !prop_src_h) {
           BOOST_LOG(error) << "Cursor plane is missing required plane SRC properties!"sv;
           BOOST_LOG(error) << "Atomic mode-setting must be enabled to capture the cursor!"sv;
           cursor_plane_id = -1;
-          captured_cursor.visible = false;
+          captured_cursor.hide();
           return;
         }
 
@@ -1447,8 +1470,7 @@ namespace platf {
         bool cursor_dirty = false;
 
         if (!plane->fb_id) {
-          captured_cursor.visible = false;
-          captured_cursor.fb_id = 0;
+          captured_cursor.hide();
         } else if (plane->fb_id != captured_cursor.fb_id) {
           BOOST_LOG(debug) << "Refreshing cursor image after FB changed"sv;
           cursor_dirty = true;
@@ -1457,19 +1479,19 @@ namespace platf {
           cursor_dirty = true;
         }
 
-        // If the cursor is dirty, map it so we can download the new image
+        // Retain the DMA-BUF for GPU consumers; only CPU consumers need to download it.
         if (cursor_dirty) {
           auto fb = card.fb(plane.get());
           if (!fb || !fb->handles[0]) {
             // This means the cursor is not currently visible
-            captured_cursor.visible = false;
+            captured_cursor.hide();
             return;
           }
 
           // All known cursor planes in the wild are ARGB8888
           if (fb->pixel_format != DRM_FORMAT_ARGB8888) {
             BOOST_LOG(error) << "Unsupported non-ARGB8888 cursor format: "sv << fb->pixel_format;
-            captured_cursor.visible = false;
+            captured_cursor.hide();
             cursor_plane_id = -1;
             return;
           }
@@ -1477,7 +1499,7 @@ namespace platf {
           // All known cursor planes in the wild require linear buffers
           if (fb->modifier != DRM_FORMAT_MOD_LINEAR && fb->modifier != DRM_FORMAT_MOD_INVALID) {
             BOOST_LOG(error) << "Unsupported non-linear cursor modifier: "sv << fb->modifier;
-            captured_cursor.visible = false;
+            captured_cursor.hide();
             cursor_plane_id = -1;
             return;
           }
@@ -1489,64 +1511,77 @@ namespace platf {
           auto src_h = *prop_src_h >> 16;
 
           // Check for a legal source rectangle
-          if (src_x + src_w > fb->width || src_y + src_h > fb->height) {
+          if (!src_w || !src_h || fb->width > INT_MAX || fb->height > INT_MAX || src_x + src_w > fb->width || src_y + src_h > fb->height) {
             BOOST_LOG(error) << "Illegal source size: ["sv << src_x + src_w << ',' << src_y + src_h << "] > ["sv << fb->width << ',' << fb->height << ']';
-            captured_cursor.visible = false;
+            captured_cursor.hide();
             return;
           }
 
           file_t plane_fd = card.handleFD(fb->handles[0]);
           if (plane_fd.el < 0) {
-            captured_cursor.visible = false;
+            captured_cursor.hide();
             return;
           }
 
-          // We will map the entire region, but only copy what the source rectangle specifies
-          size_t mapped_size = ((size_t) fb->pitches[0]) * fb->height;
-          void *mapped_data = mmap(nullptr, mapped_size, PROT_READ, MAP_SHARED, plane_fd.el, fb->offsets[0]);
+          if (uses_gpu_cursor()) {
+            egl::surface_descriptor_t surface {};
+            surface.width = fb->width;
+            surface.height = fb->height;
+            std::fill_n(surface.fds, 4, -1);
+            surface.fds[0] = plane_fd.el;
+            surface.fourcc = fb->pixel_format;
+            surface.modifier = fb->modifier;
+            surface.pitches[0] = fb->pitches[0];
+            surface.offsets[0] = fb->offsets[0];
+            captured_cursor.surface = std::make_shared<const egl::cursor_surface_t>(std::move(plane_fd), surface, (int) src_x, (int) src_y, (int) src_w, (int) src_h);
+          } else {
+            // We will map the entire region, but only copy what the source rectangle specifies
+            size_t mapped_size = ((size_t) fb->pitches[0]) * fb->height;
+            void *mapped_data = mmap(nullptr, mapped_size, PROT_READ, MAP_SHARED, plane_fd.el, fb->offsets[0]);
 
-          // If we got ENOSYS back, let's try to map it as a dumb buffer instead (required for Nvidia GPUs)
-          if (mapped_data == MAP_FAILED && errno == ENOSYS) {
-            drm_mode_map_dumb map = {};
-            map.handle = fb->handles[0];
-            if (drmIoctl(card.fd.el, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
-              BOOST_LOG(error) << "Failed to map cursor FB as dumb buffer: "sv << strerror(errno);
-              captured_cursor.visible = false;
+            // If we got ENOSYS back, let's try to map it as a dumb buffer instead (required for Nvidia GPUs)
+            if (mapped_data == MAP_FAILED && errno == ENOSYS) {
+              drm_mode_map_dumb map = {};
+              map.handle = fb->handles[0];
+              if (drmIoctl(card.fd.el, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
+                BOOST_LOG(error) << "Failed to map cursor FB as dumb buffer: "sv << strerror(errno);
+                captured_cursor.hide();
+                return;
+              }
+
+              mapped_data = mmap(nullptr, mapped_size, PROT_READ, MAP_SHARED, card.fd.el, map.offset);
+            }
+
+            if (mapped_data == MAP_FAILED) {
+              BOOST_LOG(error) << "Failed to mmap cursor FB: "sv << strerror(errno);
+              captured_cursor.hide();
               return;
             }
 
-            mapped_data = mmap(nullptr, mapped_size, PROT_READ, MAP_SHARED, card.fd.el, map.offset);
-          }
+            captured_cursor.pixels.resize(src_w * src_h * 4);
 
-          if (mapped_data == MAP_FAILED) {
-            BOOST_LOG(error) << "Failed to mmap cursor FB: "sv << strerror(errno);
-            captured_cursor.visible = false;
-            return;
-          }
+            // Prepare to read the dmabuf from the CPU
+            struct dma_buf_sync sync;
+            sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+            drmIoctl(plane_fd.el, DMA_BUF_IOCTL_SYNC, &sync);
 
-          captured_cursor.pixels.resize(src_w * src_h * 4);
-
-          // Prepare to read the dmabuf from the CPU
-          struct dma_buf_sync sync;
-          sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-          drmIoctl(plane_fd.el, DMA_BUF_IOCTL_SYNC, &sync);
-
-          // If the image is tightly packed, copy it in one shot
-          if (fb->pitches[0] == src_w * 4 && src_x == 0) {
-            memcpy(captured_cursor.pixels.data(), &((std::uint8_t *) mapped_data)[src_y * fb->pitches[0]], src_h * fb->pitches[0]);
-          } else {
-            // Copy row by row to deal with mismatched pitch or an X offset
-            auto pixel_dst = captured_cursor.pixels.data();
-            for (int y = 0; y < src_h; y++) {
-              memcpy(&pixel_dst[y * (src_w * 4)], &((std::uint8_t *) mapped_data)[(y + src_y) * fb->pitches[0] + (src_x * 4)], src_w * 4);
+            // If the image is tightly packed, copy it in one shot
+            if (fb->pitches[0] == src_w * 4 && src_x == 0) {
+              memcpy(captured_cursor.pixels.data(), &((std::uint8_t *) mapped_data)[src_y * fb->pitches[0]], src_h * fb->pitches[0]);
+            } else {
+              // Copy row by row to deal with mismatched pitch or an X offset
+              auto pixel_dst = captured_cursor.pixels.data();
+              for (int y = 0; y < src_h; y++) {
+                memcpy(&pixel_dst[y * (src_w * 4)], &((std::uint8_t *) mapped_data)[(y + src_y) * fb->pitches[0] + (src_x * 4)], src_w * 4);
+              }
             }
+
+            // End the CPU read and unmap the dmabuf
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            drmIoctl(plane_fd.el, DMA_BUF_IOCTL_SYNC, &sync);
+
+            munmap(mapped_data, mapped_size);
           }
-
-          // End the CPU read and unmap the dmabuf
-          sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-          drmIoctl(plane_fd.el, DMA_BUF_IOCTL_SYNC, &sync);
-
-          munmap(mapped_data, mapped_size);
 
           captured_cursor.visible = true;
           captured_cursor.src_w = src_w;
@@ -1566,9 +1601,10 @@ namespace platf {
        * @param file DMA-BUF file descriptors exported for the current framebuffer.
        * @param sd EGL surface descriptor to import.
        * @param frame_timestamp Output timestamp assigned to the captured frame.
+       * @param cursor Whether this frame includes the cursor.
        * @return Capture status after refreshing framebuffer and cursor state.
        */
-      inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp) {
+      inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp, bool cursor) {
         // Check for a change in HDR metadata
         if (connector_id) {
           auto connector_props = card.connector_props(*connector_id);
@@ -1627,7 +1663,12 @@ namespace platf {
           return capture_e::reinit;
         }
 
-        update_cursor();
+        if (cursor) {
+          update_cursor();
+        } else {
+          captured_cursor.hide();
+          captured_cursor_props.clear();
+        }
         captured_fb_id = plane->fb_id;
 
         return capture_e::ok;
@@ -1870,7 +1911,7 @@ namespace platf {
         egl::surface_descriptor_t sd;
 
         std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
-        auto status = refresh(fb_fd, &sd, frame_timestamp);
+        auto status = refresh(fb_fd, &sd, frame_timestamp, cursor);
         if (status != capture_e::ok) {
           return status;
         }
@@ -1950,6 +1991,14 @@ namespace platf {
        */
       display_vram_t(mem_type_e mem_type):
           display_t(mem_type) {
+      }
+
+      /**
+       * @brief Enable external cursor sampling only for the CUDA VRAM converter.
+       * @return True when this VRAM display is encoded through CUDA.
+       */
+      bool uses_gpu_cursor() const override {
+        return mem_type == mem_type_e::cuda;
       }
 
       /**
@@ -2035,7 +2084,7 @@ namespace platf {
         auto img = (egl::img_descriptor_t *) img_out.get();
         img->reset();
 
-        auto status = refresh(fb_fd, &img->sd, img->frame_timestamp);
+        auto status = refresh(fb_fd, &img->sd, img->frame_timestamp, cursor);
         if (status != capture_e::ok) {
           return status;
         }
@@ -2043,11 +2092,12 @@ namespace platf {
         img->sequence = ++sequence;
 
         if (cursor && captured_cursor.visible) {
-          // Copy new cursor pixel data if it's been updated
-          if (img->serial != captured_cursor.serial) {
+          img->cursor_surface = captured_cursor.surface;
+          // CPU consumers retain their existing pixel upload path.
+          if (!img->cursor_surface && img->serial != captured_cursor.serial) {
             img->buffer = captured_cursor.pixels;
-            img->serial = captured_cursor.serial;
           }
+          img->serial = captured_cursor.serial;
 
           img->x = captured_cursor.x;
           img->y = captured_cursor.y;
@@ -2057,7 +2107,7 @@ namespace platf {
           img->height = captured_cursor.dst_h;
           img->pixel_pitch = 4;
           img->row_pitch = img->pixel_pitch * img->width;
-          img->data = img->buffer.data();
+          img->data = img->cursor_surface ? nullptr : img->buffer.data();
         } else {
           img->data = nullptr;
         }

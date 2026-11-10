@@ -54,6 +54,7 @@ extern "C" {
 using namespace std::literals;
 
 namespace gl {
+  constexpr GLenum external_texture_target = 0x8D65;  ///< GL_TEXTURE_EXTERNAL_OES, absent from desktop GL headers.
   GladGLContext ctx;  ///< Loaded OpenGL function table for the active context.
 
   static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC egl_image_target_texture_2d_fn = nullptr;
@@ -97,6 +98,17 @@ namespace gl {
       gl::ctx.TexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, color);
     }
 
+    return textures;
+  }
+
+  tex_t tex_t::make_external() {
+    tex_t textures {1};
+    ctx.GenTextures(1, textures.begin());
+    ctx.BindTexture(external_texture_target, textures[0]);
+    ctx.TexParameteri(external_texture_target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    ctx.TexParameteri(external_texture_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    ctx.TexParameteri(external_texture_target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    ctx.TexParameteri(external_texture_target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     return textures;
   }
 
@@ -1427,7 +1439,83 @@ namespace egl {
     gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width, img.height, GL_BGRA, GL_UNSIGNED_BYTE, img.data);
   }
 
-  void sws_t::load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture, bool is_yuv444) {
+  int sws_t::load_cursor_surface(const cursor_surface_t &cursor) {
+    if (!external_cursor_program) {
+      auto vertex = gl::shader_t::compile(file_handler::read_file(SUNSHINE_SHADERS_DIR "/CursorExternal.vert"), GL_VERTEX_SHADER);
+      auto fragment = gl::shader_t::compile(file_handler::read_file(SUNSHINE_SHADERS_DIR "/CursorExternal.frag"), GL_FRAGMENT_SHADER);
+      if (vertex.has_right() || fragment.has_right()) {
+        BOOST_LOG(error) << "Couldn't compile external cursor shaders: "sv << (vertex.has_right() ? vertex.right() : fragment.right());
+        return -1;
+      }
+      auto linked = gl::program_t::link(vertex.left(), fragment.left());
+      if (linked.has_right()) {
+        BOOST_LOG(error) << "Couldn't link external cursor shaders: "sv << linked.right();
+        return -1;
+      }
+      external_cursor_program = std::move(linked.left());
+    }
+
+    auto bind_image = gl::egl_image_target_texture_2d();
+    if (!bind_image) {
+      BOOST_LOG(error) << "External cursor import needs glEGLImageTargetTexture2DOES"sv;
+      return -1;
+    }
+
+    gl_drain_errors;
+    gl::ctx.ActiveTexture(GL_TEXTURE0);
+    auto display = eglGetCurrentDisplay();
+    auto attributes = surface_descriptor_to_egl_attribs(cursor.surface);
+    rgb_t imported {display, eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attributes.data()), gl::tex_t::make_external()};
+    if (!imported->xrgb8) {
+      BOOST_LOG(error) << "Couldn't import cursor DMA-BUF: "sv << util::hex(eglGetError()).to_string_view();
+      return -1;
+    }
+    bind_image(gl::external_texture_target, imported->xrgb8);
+    if (auto gl_error = gl::ctx.GetError(); gl_error != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't bind external cursor image: "sv << util::hex(gl_error).to_string_view();
+      return -1;
+    }
+
+    gl::ctx.BindTexture(GL_TEXTURE_2D, tex[1]);
+    gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cursor.src_w, cursor.src_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    auto target = gl::frame_buf_t::make(1);
+    target.bind(&tex[1], &tex[1] + 1);
+    gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, target[0]);
+    if (auto status = gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER); status != GL_FRAMEBUFFER_COMPLETE) {
+      BOOST_LOG(error) << "External cursor target is incomplete: "sv << util::hex(status).to_string_view();
+      return -1;
+    }
+
+    const auto program = external_cursor_program->handle();
+    gl::ctx.Disable(GL_BLEND);
+    gl::ctx.UseProgram(program);
+    gl::ctx.Uniform1i(gl::ctx.GetUniformLocation(program, "tex1"), 0);
+    gl::ctx.Uniform2f(gl::ctx.GetUniformLocation(program, "uv_offset"), (float) cursor.src_x / cursor.surface.width, (float) cursor.src_y / cursor.surface.height);
+    gl::ctx.Uniform2f(gl::ctx.GetUniformLocation(program, "uv_scale"), (float) cursor.src_w / cursor.surface.width, (float) cursor.src_h / cursor.surface.height);
+    gl::ctx.Viewport(0, 0, cursor.src_w, cursor.src_h);
+    GLenum attachment = GL_COLOR_ATTACHMENT0;
+    gl::ctx.DrawBuffers(1, &attachment);
+    gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+    gl::ctx.BindTexture(gl::external_texture_target, 0);
+    gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (auto gl_error = gl::ctx.GetError(); gl_error != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't render external cursor image: "sv << util::hex(gl_error).to_string_view();
+      return -1;
+    }
+    return 0;
+  }
+
+  int sws_t::load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture, bool is_yuv444) {
+    if (img.cursor_surface != cursor_surface) {
+      cursor_surface.reset();
+      serial = std::numeric_limits<std::uint64_t>::max();
+      if (img.cursor_surface) {
+        if (load_cursor_surface(*img.cursor_surface)) {
+          return -1;
+        }
+        cursor_surface = img.cursor_surface;
+      }
+    }
     // When only a sub-part of the image must be encoded...
     const bool copy = offset_x || offset_y || img.sd.width != in_width || img.sd.height != in_height;
     if (copy) {
@@ -1440,7 +1528,15 @@ namespace egl {
       loaded_texture = texture;
     }
 
-    if (img.data) {
+    if (img.data || img.cursor_surface) {
+      auto restore = util::fail_guard([&] {
+        gl::ctx.Disable(GL_BLEND);
+        if (img.cursor_surface) {
+          gl::ctx.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+        gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+        gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
+      });
       GLenum attachment = GL_COLOR_ATTACHMENT0;
 
       gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, cursor_framebuffer[0]);
@@ -1461,32 +1557,32 @@ namespace egl {
       }
 
       gl::ctx.BindTexture(GL_TEXTURE_2D, tex[1]);
-      if (serial != img.serial) {
+      if (!img.cursor_surface && serial != img.serial) {
         serial = img.serial;
 
         gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.src_w, img.src_h, 0, GL_BGRA, GL_UNSIGNED_BYTE, img.data);
       }
 
       gl::ctx.Enable(GL_BLEND);
+      if (img.cursor_surface) {
+        gl::ctx.BlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      }
 
       gl::ctx.DrawBuffers(1, &attachment);
 
-#ifndef NDEBUG
       auto status = gl::ctx.CheckFramebufferStatus(GL_FRAMEBUFFER);
       if (status != GL_FRAMEBUFFER_COMPLETE) {
         BOOST_LOG(error) << "Pass Cursor: CheckFramebufferStatus() --> [0x"sv << util::hex(status).to_string_view() << ']';
-        return;
+        return -1;
       }
-#endif
-
       gl::ctx.Viewport(img.x, img.y, img.width, img.height);
       gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
-
-      gl::ctx.Disable(GL_BLEND);
-
-      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-      gl::ctx.BindFramebuffer(GL_FRAMEBUFFER, 0);
     }
+    if (auto gl_error = gl::ctx.GetError(); gl_error != GL_NO_ERROR) {
+      BOOST_LOG(error) << "Couldn't composite the captured frame and cursor: "sv << util::hex(gl_error).to_string_view();
+      return -1;
+    }
+    return 0;
   }
 
   int sws_t::draw_programs_to_buffers(GLenum attachments[], gl::frame_buf_t &fb, int count, bool is_yuv444) {

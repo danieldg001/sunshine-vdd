@@ -116,6 +116,12 @@ namespace gl {
      * @return Created backend object, or null when creation fails.
      */
     static tex_t make(std::size_t count);
+
+    /**
+     * @brief Allocate an external-OES texture without first binding it as a 2D texture.
+     * @return Texture configured for sampling an imported DMA-BUF.
+     */
+    static tex_t make_external();
   };
 
   /**
@@ -505,6 +511,18 @@ namespace egl {
   };
 
   /**
+   * @brief Immutable cursor DMA-BUF and the source rectangle sampled from it.
+   */
+  struct cursor_surface_t {
+    const file_t fd;  ///< Owns the descriptor borrowed by surface.fds[0].
+    const surface_descriptor_t surface;  ///< ARGB cursor plane metadata.
+    const int src_x;  ///< Source rectangle X offset in pixels.
+    const int src_y;  ///< Source rectangle Y offset in pixels.
+    const int src_w;  ///< Source rectangle width in pixels.
+    const int src_h;  ///< Source rectangle height in pixels.
+  };
+
+  /**
    * @brief Open and initialize the display connection used for capture.
    *
    * @param native_display Native display.
@@ -626,6 +644,7 @@ namespace egl {
      * @brief Reset the object to its initial empty state.
      */
     void reset() {
+      cursor_surface.reset();
       for (auto x = 0; x < 4; ++x) {
         if (sd.fds[x] >= 0) {
           close(sd.fds[x]);
@@ -636,6 +655,7 @@ namespace egl {
     }
 
     surface_descriptor_t sd;  ///< DMA-BUF surface descriptor for the captured image.
+    std::shared_ptr<const cursor_surface_t> cursor_surface;  ///< GPU cursor image retained with this frame.
 
     // Increment sequence when new rgb_t needs to be created
     std::uint64_t sequence;  ///< Monotonic value used to detect when GL resources must be recreated.
@@ -749,8 +769,16 @@ namespace egl {
      * @param offset_y Offset y.
      * @param texture Texture resource to bind, update, or attach.
      * @param is_yuv444 Is YUV444.
+     * @return 0 on success or -1 when importing or rendering the cursor fails.
      */
-    void load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture, bool is_yuv444);
+    int load_vram(img_descriptor_t &img, int offset_x, int offset_y, int texture, bool is_yuv444);
+
+    /**
+     * @brief Import and crop a cursor DMA-BUF into the existing 2D cursor texture.
+     * @param cursor Cursor surface and its source rectangle.
+     * @return 0 on success or -1 when import, shader setup, or rendering fails.
+     */
+    int load_cursor_surface(const cursor_surface_t &cursor);
 
     /**
      * @brief Apply the configured colorspace metadata to the active frame.
@@ -785,6 +813,8 @@ namespace egl {
 
     // Store latest cursor for load_vram
     std::uint64_t serial;  ///< Serial.
+    std::shared_ptr<const cursor_surface_t> cursor_surface;  ///< Identity of the cursor already copied into tex[1].
+    std::optional<gl::program_t> external_cursor_program;  ///< External-OES to RGBA8 copy shader.
   };
 
   /**
